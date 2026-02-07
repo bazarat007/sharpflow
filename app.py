@@ -62,11 +62,26 @@ API_DELAY = 0.35          # Seconds between API calls
 # Category keywords
 SPORTS_KW = ["sports","nfl","nba","mlb","nhl","soccer","football","basketball",
              "baseball","ufc","mma","tennis","boxing","cricket","f1","golf",
-             "rugby","hockey","super bowl","playoffs","championship","game","match"]
+             "rugby","hockey","super bowl","playoffs","championship","game","match",
+             "world series","stanley cup","premier league","champions league",
+             "la liga", "serie a", "bundesliga", "euros", "copa", "olympic",
+             "ncaa", "march madness", "draft", "mvp", "heisman", "batting",
+             "touchdown", "goal scored", "points scored", "win the",
+             "win against", "beat the", "defeat", "series", "season"]
 POLITICS_KW = ["politics","election","president","congress","senate","governor",
                "trump","biden","democrat","republican","vote","legislation",
                "cabinet","supreme court","government","policy","fed","tariff",
-               "executive order","parliament","minister","geopolitics","primary"]
+               "executive order","parliament","minister","geopolitics","primary",
+               "inaugural","impeach","veto","gop","dnc","rnc","liberal",
+               "conservative","poll","approval rating","midterm","swing state",
+               "electoral","white house","pentagon","state department","cia",
+               "fbi","doj","attorney general","speaker of","majority leader",
+               "secretary of","ambassador","nato","un general","g7","g20",
+               "sanctions","ceasefire","war","conflict","ukraine","russia",
+               "china","iran","israel","gaza","palestine","north korea",
+               "negotiate","treaty","border","immigration","refugee","asylum",
+               "ban","mandate","regulation","deregulat","executive action",
+               "pardon","indictment","arraign","conviction","verdict"]
 
 # Telegram (optional)
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -323,6 +338,11 @@ def score_all_wallets(trades, markets_lookup):
                 trade_count += 1
 
                 if side == "BUY":
+                    # Skip "fake edge" trades — buying at 95c+ on near-certain outcomes
+                    # These inflate win rate without indicating real predictive ability
+                    if price >= 0.95 and outcome_won:
+                        continue
+
                     clvs.append(res_price - price)
                     timing_scores.append((0.5 - price) if outcome_won else (price - 0.5))
                     pnl = (res_price - price) * size
@@ -347,16 +367,24 @@ def score_all_wallets(trades, markets_lookup):
 
         # Component scores
         avg_clv = float(np.mean(clvs))
+        # CLV score: -0.1 maps to 0, +0.42 maps to 1
         clv_score = max(0, min(1, (avg_clv + 0.1) / 0.52))
 
         avg_timing = float(np.mean(timing_scores)) if timing_scores else 0
         early_pct = sum(1 for t in timing_scores if t > 0) / len(timing_scores) if timing_scores else 0
-        timing_score = max(0, min(1, (early_pct - 0.3) / 0.6))
+        # FIXED: Lower threshold from 0.3 to 0.1, wider range
+        # Now: 10% early entries = 0, 70% early entries = 1
+        timing_score = max(0, min(1, (early_pct - 0.1) / 0.6))
 
         mkt_won = sum(1 for p in market_pnls.values() if p > 0)
         mkt_lost = sum(1 for p in market_pnls.values() if p <= 0)
         win_rate = mkt_won / len(market_pnls) if market_pnls else 0
-        consistency_score = win_rate * min(1.0, distinct / 100)
+
+        # FIXED: Use sqrt scaling instead of linear division by 100
+        # 15 markets → 0.39, 30 → 0.55, 50 → 0.71, 100 → 1.0
+        # This stops punishing wallets just for having fewer (but sufficient) markets
+        market_count_factor = min(1.0, (distinct / 100) ** 0.5)
+        consistency_score = win_rate * market_count_factor
 
         total_pnl = total_ret - total_inv
         roi = total_pnl / total_inv if total_inv > 0 else 0
@@ -364,7 +392,9 @@ def score_all_wallets(trades, markets_lookup):
 
         sharpness = W_CLV * clv_score + W_TIMING * timing_score + W_CONSISTENCY * consistency_score + W_ROI * roi_score
 
-        tier = "elite" if sharpness >= 0.70 else "sharp" if sharpness >= 0.50 else "average" if sharpness >= 0.30 else "dull"
+        # Tier thresholds — tuned for real Polymarket data distributions
+        # Real-world scores cluster lower than synthetic tests
+        tier = "elite" if sharpness >= 0.55 else "sharp" if sharpness >= 0.38 else "average" if sharpness >= 0.22 else "dull"
 
         sample = wtrades[0]
         name = sample.get("pseudonym") or sample.get("name") or wallet[:12] + "..."
@@ -416,7 +446,7 @@ def detect_convergence(scored_wallets, trades):
     logger.info("Detecting convergence signals...")
     state["progress"] = "Detecting convergence..."
 
-    sharp_wallets = {w["wallet"]: w for w in scored_wallets if w["sharpness_score"] >= 0.50}
+    sharp_wallets = {w["wallet"]: w for w in scored_wallets if w["sharpness_score"] >= 0.38}
     if not sharp_wallets:
         return []
 
