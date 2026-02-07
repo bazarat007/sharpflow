@@ -445,12 +445,12 @@ def detect_convergence(scored_wallets, trades):
     """
     Detect markets where multiple sharp wallets align.
     
-    ONLY looks at current open positions (not historical resolved trades).
+    ONLY looks at positions on OPEN/ACTIVE markets.
     Filters out:
+      - Resolved/closed markets (the big one — no point signaling on finished events)
       - Dead markets (price > 90c or < 10c — outcome is already obvious)
       - Dust positions (< $50 notional)
       - Markets where the same small cluster appears everywhere
-      - Resolved/closed markets
     """
     logger.info("Detecting convergence signals...")
     state["progress"] = "Detecting convergence..."
@@ -458,6 +458,56 @@ def detect_convergence(scored_wallets, trades):
     sharp_wallets = {w["wallet"]: w for w in scored_wallets if w["sharpness_score"] >= 0.38}
     if not sharp_wallets:
         logger.info("No sharp wallets found for convergence detection")
+        return []
+
+    # ---- Step 0: Build set of OPEN market condition IDs ----
+    state["progress"] = "Fetching open markets for convergence..."
+    logger.info("Fetching open/active markets...")
+    open_market_ids = set()
+    open_market_meta = {}  # cid -> {question, slug, end_date, volume}
+    offset = 0
+
+    while True:
+        data = api_get(f"{GAMMA_API}/markets", {
+            "closed": "false",
+            "limit": 100,
+            "offset": offset,
+            "order": "volume",
+            "ascending": "false",
+        })
+        if not data or not isinstance(data, list) or len(data) == 0:
+            break
+
+        for m in data:
+            cid = m.get("conditionId") or m.get("condition_id") or ""
+            if cid:
+                open_market_ids.add(cid)
+                open_market_meta[cid] = {
+                    "question": m.get("question", ""),
+                    "slug": m.get("slug", ""),
+                    "end_date": m.get("endDate", ""),
+                    "volume": float(m.get("volume", 0) or 0),
+                }
+
+                # Also grab current prices from tokens if available
+                tokens = m.get("tokens", [])
+                if isinstance(tokens, list):
+                    for tok in tokens:
+                        if isinstance(tok, dict):
+                            tp = float(tok.get("price", 0) or 0)
+                            if tp > 0:
+                                outcome = (tok.get("outcome", "") or "").lower()
+                                if outcome in ("yes", "y"):
+                                    open_market_meta[cid]["yes_price"] = tp
+
+        offset += 100
+        if len(data) < 100 or offset >= 2000:  # Cap at 2000 open markets
+            break
+
+    logger.info(f"Found {len(open_market_ids)} open markets")
+
+    if not open_market_ids:
+        logger.warning("No open markets found — cannot detect convergence")
         return []
 
     logger.info(f"Checking current positions for {len(sharp_wallets)} sharp wallets...")
@@ -477,6 +527,10 @@ def detect_convergence(scored_wallets, trades):
                     if not cid:
                         continue
 
+                    # CRITICAL FILTER: Only count positions on OPEN markets
+                    if cid not in open_market_ids:
+                        continue
+
                     size = float(pos.get("size", 0) or 0)
                     avg_price = float(pos.get("avgPrice", 0) or pos.get("price", 0) or 0)
                     cur_price = float(pos.get("curPrice", 0) or pos.get("currentPrice", 0) or 0)
@@ -489,11 +543,17 @@ def detect_convergence(scored_wallets, trades):
                     outcome = (pos.get("outcome", "") or "").lower()
                     title = pos.get("title", "") or pos.get("eventTitle", "") or ""
 
+                    # Use open market metadata for better title and price
+                    meta = open_market_meta.get(cid, {})
+                    if meta.get("question"):
+                        title = meta["question"]
                     if title:
                         market_titles[cid] = title
 
-                    # Track market price for dead-market filtering
-                    if cur_price > 0:
+                    # Use market's current YES price if available
+                    if meta.get("yes_price"):
+                        market_prices[cid] = meta["yes_price"]
+                    elif cur_price > 0:
                         market_prices[cid] = cur_price
                     elif avg_price > 0:
                         market_prices.setdefault(cid, avg_price)
@@ -521,6 +581,72 @@ def detect_convergence(scored_wallets, trades):
             logger.debug(f"Failed to fetch positions for {wallet_addr[:10]}: {e}")
 
     logger.info(f"Scanned {wallets_checked} wallets, found positions in {len(market_positions)} markets")
+
+    # ---- Verify markets are actually OPEN (not resolved) ----
+    # Fetch market status from Gamma API for each candidate market
+    logger.info(f"Verifying {len(market_positions)} markets are still active...")
+    state["progress"] = f"Verifying market status for {len(market_positions)} markets..."
+
+    resolved_markets = set()
+    verified_count = 0
+
+    # Build a set of all condition IDs we need to check
+    cids_to_check = list(market_positions.keys())
+
+    for cid in cids_to_check:
+        # Check via Gamma API if market is still open
+        try:
+            data = api_get(f"{GAMMA_API}/markets", {"conditionId": cid, "limit": 1})
+            if data and isinstance(data, list) and len(data) > 0:
+                mkt = data[0]
+                is_closed = mkt.get("closed", False)
+                is_resolved = mkt.get("resolved", False)
+                end_date = mkt.get("endDate", "") or mkt.get("end_date_iso", "")
+
+                # Update title if we got a better one
+                question = mkt.get("question", "")
+                if question:
+                    market_titles[cid] = question
+
+                # Get current price from tokens
+                tokens = mkt.get("tokens", [])
+                if isinstance(tokens, list):
+                    for tok in tokens:
+                        if isinstance(tok, dict):
+                            tp = float(tok.get("price", 0) or 0)
+                            if tp > 0:
+                                market_prices[cid] = tp
+                                break
+
+                # Also check outcomePrices for resolution
+                try:
+                    op = mkt.get("outcomePrices", "")
+                    if op:
+                        if isinstance(op, str):
+                            op = json.loads(op)
+                        if isinstance(op, list):
+                            for p in op:
+                                if float(p) >= 0.95:
+                                    is_resolved = True
+                                    break
+                except Exception:
+                    pass
+
+                if is_closed or is_resolved:
+                    resolved_markets.add(cid)
+
+            verified_count += 1
+            if verified_count % 10 == 0:
+                state["progress"] = f"Verifying markets: {verified_count}/{len(cids_to_check)}..."
+
+        except Exception as e:
+            logger.debug(f"Failed to verify market {cid[:10]}: {e}")
+
+    # Remove resolved markets
+    for cid in resolved_markets:
+        del market_positions[cid]
+
+    logger.info(f"Market verification: {len(resolved_markets)} resolved/closed removed, {len(market_positions)} active remain")
 
     # ---- Score convergence with quality filters ----
     signals = []
