@@ -444,9 +444,13 @@ def score_all_wallets(trades, markets_lookup):
 def detect_convergence(scored_wallets, trades):
     """
     Detect markets where multiple sharp wallets align.
-    Two sources:
-      1. Historical trades from resolved markets (shows past patterns)
-      2. Current positions on OPEN markets (the actionable signals)
+    
+    ONLY looks at current open positions (not historical resolved trades).
+    Filters out:
+      - Dead markets (price > 90c or < 10c — outcome is already obvious)
+      - Dust positions (< $50 notional)
+      - Markets where the same small cluster appears everywhere
+      - Resolved/closed markets
     """
     logger.info("Detecting convergence signals...")
     state["progress"] = "Detecting convergence..."
@@ -458,14 +462,14 @@ def detect_convergence(scored_wallets, trades):
 
     logger.info(f"Checking current positions for {len(sharp_wallets)} sharp wallets...")
 
-    # ---- Phase 1: Fetch CURRENT positions for sharp wallets on OPEN markets ----
+    # ---- Fetch CURRENT positions for sharp wallets ----
     market_positions = defaultdict(lambda: {"yes": [], "no": []})
     market_titles = {}
+    market_prices = {}  # cid -> current mid price (from position avg prices)
     wallets_checked = 0
 
     for wallet_addr, wdata in sharp_wallets.items():
         try:
-            # Fetch this wallet's current open positions
             positions = api_get(f"{DATA_API}/positions", {"user": wallet_addr, "sizeThreshold": 10})
             if positions and isinstance(positions, list):
                 for pos in positions:
@@ -474,15 +478,25 @@ def detect_convergence(scored_wallets, trades):
                         continue
 
                     size = float(pos.get("size", 0) or 0)
-                    if size < 5:  # Skip dust positions
+                    avg_price = float(pos.get("avgPrice", 0) or pos.get("price", 0) or 0)
+                    cur_price = float(pos.get("curPrice", 0) or pos.get("currentPrice", 0) or 0)
+
+                    # Skip dust positions (less than $50 notional value)
+                    notional = size * avg_price
+                    if notional < 50:
                         continue
 
                     outcome = (pos.get("outcome", "") or "").lower()
-                    avg_price = float(pos.get("avgPrice", 0) or pos.get("price", 0) or 0)
-                    title = pos.get("title", "") or pos.get("eventTitle", "") or cid[:16]
+                    title = pos.get("title", "") or pos.get("eventTitle", "") or ""
 
                     if title:
                         market_titles[cid] = title
+
+                    # Track market price for dead-market filtering
+                    if cur_price > 0:
+                        market_prices[cid] = cur_price
+                    elif avg_price > 0:
+                        market_prices.setdefault(cid, avg_price)
 
                     entry = {
                         "wallet": wallet_addr,
@@ -491,6 +505,7 @@ def detect_convergence(scored_wallets, trades):
                         "tier": wdata["tier"],
                         "size": size,
                         "price": avg_price,
+                        "notional": round(notional, 2),
                     }
 
                     if outcome in ("yes", "y", "1", ""):
@@ -507,42 +522,18 @@ def detect_convergence(scored_wallets, trades):
 
     logger.info(f"Scanned {wallets_checked} wallets, found positions in {len(market_positions)} markets")
 
-    # ---- Phase 2: Also add recent trade data from historical trades ----
-    for t in trades:
-        wallet = t["wallet"]
-        if wallet not in sharp_wallets:
-            continue
-        cid = t["condition_id"]
-        wdata = sharp_wallets[wallet]
-        outcome = t.get("outcome", "").lower()
-        side = t.get("side", "BUY")
-        title = t.get("title", "")
-        if title:
-            market_titles[cid] = title
-
-        entry = {
-            "wallet": wallet,
-            "display_name": wdata["display_name"],
-            "sharpness_score": wdata["sharpness_score"],
-            "tier": wdata["tier"],
-            "size": t["size"],
-            "price": t["price"],
-        }
-
-        if side == "BUY":
-            if outcome in ("yes", "y", "1", ""):
-                market_positions[cid]["yes"].append(entry)
-            else:
-                market_positions[cid]["no"].append(entry)
-        else:
-            if outcome in ("yes", "y", "1", ""):
-                market_positions[cid]["no"].append(entry)
-            else:
-                market_positions[cid]["yes"].append(entry)
-
-    # ---- Phase 3: Score convergence ----
+    # ---- Score convergence with quality filters ----
     signals = []
+    skipped_dead = 0
+    skipped_small = 0
+
     for cid, pos in market_positions.items():
+        # FILTER: Skip dead markets (price implies outcome is already known)
+        mid_price = market_prices.get(cid, 0.5)
+        if mid_price > 0.90 or mid_price < 0.10:
+            skipped_dead += 1
+            continue
+
         for direction, wallets in [("YES", pos["yes"]), ("NO", pos["no"])]:
             # Deduplicate by wallet
             seen = {}
@@ -552,16 +543,23 @@ def detect_convergence(scored_wallets, trades):
                     seen[addr] = w
             unique_wallets = list(seen.values())
 
-            if len(unique_wallets) < 2:  # Lowered from 3 to 2 for smaller wallet universe
+            # FILTER: Need at least 3 distinct wallets for a meaningful signal
+            if len(unique_wallets) < 3:
+                skipped_small += 1
                 continue
 
             combined_score = sum(w["sharpness_score"] for w in unique_wallets)
-            if combined_score < 0.8:  # Lowered from 1.5
+            if combined_score < 1.0:
                 continue
 
             elite_count = sum(1 for w in unique_wallets if w["tier"] == "elite")
             sharp_count = sum(1 for w in unique_wallets if w["tier"] == "sharp")
             total_size = sum(w["size"] for w in unique_wallets)
+            total_notional = sum(w.get("notional", 0) for w in unique_wallets)
+
+            # FILTER: Minimum $200 combined notional
+            if total_notional < 200:
+                continue
 
             opp = pos["no"] if direction == "YES" else pos["yes"]
             opp_seen = {}
@@ -571,11 +569,17 @@ def detect_convergence(scored_wallets, trades):
             opp_score = sum(w["sharpness_score"] for w in opp_seen.values())
             agreement = combined_score / (combined_score + opp_score) if (combined_score + opp_score) > 0 else 1.0
 
-            strength = 0.4 * min(1, len(unique_wallets) / 4) + 0.3 * min(1, combined_score / 2) + 0.3 * agreement
+            # Strength formula: wallet diversity + combined sharpness + agreement + money committed
+            strength = (
+                0.25 * min(1, len(unique_wallets) / 5) +    # More independent wallets = stronger
+                0.25 * min(1, combined_score / 2.5) +        # Higher combined sharpness = stronger
+                0.25 * agreement +                            # Less opposition = stronger
+                0.25 * min(1, total_notional / 5000)          # More money committed = stronger
+            )
 
-            if elite_count >= 2 and len(unique_wallets) >= 3:
+            if elite_count >= 2 and len(unique_wallets) >= 4:
                 sig_type = "STRONG_CONVERGENCE"
-            elif elite_count >= 1 or (sharp_count >= 2 and len(unique_wallets) >= 3):
+            elif elite_count >= 1 or (sharp_count >= 2 and len(unique_wallets) >= 4):
                 sig_type = "CONVERGENCE"
             else:
                 sig_type = "MILD_CONVERGENCE"
@@ -590,16 +594,169 @@ def detect_convergence(scored_wallets, trades):
                 "strength": round(strength, 4),
                 "wallet_count": len(unique_wallets),
                 "elite_count": elite_count,
+                "sharp_count": sharp_count,
                 "combined_sharpness": round(combined_score, 4),
                 "opposition_score": round(opp_score, 4),
                 "agreement_ratio": round(agreement, 4),
                 "total_size": round(total_size, 2),
+                "total_notional": round(total_notional, 2),
+                "market_price": round(mid_price, 3),
                 "wallets": sorted(unique_wallets, key=lambda w: w["sharpness_score"], reverse=True)[:10],
             })
 
+    # Deduplicate signals from related markets (same wallets, similar titles)
+    # Sort by strength, then remove signals where >75% of wallets overlap with a stronger signal
     signals.sort(key=lambda s: s["strength"], reverse=True)
-    logger.info(f"Found {len(signals)} convergence signals")
-    return signals
+    filtered_signals = []
+    seen_wallet_sets = []
+
+    for sig in signals:
+        sig_wallets = set(w["wallet"] for w in sig["wallets"])
+
+        is_duplicate = False
+        for prev_wallets in seen_wallet_sets:
+            overlap = len(sig_wallets & prev_wallets)
+            if overlap >= len(sig_wallets) * 0.75:
+                is_duplicate = True
+                break
+
+        if not is_duplicate:
+            filtered_signals.append(sig)
+            seen_wallet_sets.append(sig_wallets)
+
+    logger.info(f"Convergence: {len(signals)} raw → {len(filtered_signals)} after dedup "
+                f"(skipped {skipped_dead} dead markets, {skipped_small} too few wallets)")
+    return filtered_signals
+
+
+# ================================================================
+# LEADERBOARD SEEDING
+# ================================================================
+
+def fetch_leaderboard_wallets(limit=200):
+    """
+    Pull top traders from Polymarket's leaderboard.
+    These are the biggest whales — some sharp, some lucky.
+    We force-scan their full history so the scoring engine can decide.
+    """
+    logger.info(f"Fetching top {limit} leaderboard wallets...")
+    state["progress"] = "Seeding from Polymarket leaderboard..."
+
+    wallets = set()
+
+    # Try multiple leaderboard periods to get a diverse set
+    for period in ["all", "daily", "weekly", "monthly"]:
+        data = api_get(f"{DATA_API}/leaderboard", {"limit": 100, "period": period})
+        if data and isinstance(data, list):
+            for entry in data:
+                addr = entry.get("proxyWallet") or entry.get("userAddress") or entry.get("address") or ""
+                if addr:
+                    wallets.add(addr)
+            logger.info(f"  Leaderboard [{period}]: found {len(data)} entries")
+        elif isinstance(data, dict):
+            # Some endpoints return {"leaderboard": [...]}
+            entries = data.get("leaderboard", data.get("data", data.get("results", [])))
+            if isinstance(entries, list):
+                for entry in entries:
+                    addr = entry.get("proxyWallet") or entry.get("userAddress") or entry.get("address") or ""
+                    if addr:
+                        wallets.add(addr)
+                logger.info(f"  Leaderboard [{period}]: found {len(entries)} entries")
+
+    logger.info(f"Found {len(wallets)} unique leaderboard wallets")
+    return list(wallets)[:limit]
+
+
+def fetch_wallet_trade_history(wallet_addr, markets_lookup):
+    """
+    Fetch the full trade history for a specific wallet.
+    Returns normalized trades enriched with market resolution data.
+    """
+    all_trades = []
+    offset = 0
+    max_trades = 2000
+
+    while offset < max_trades:
+        data = api_get(f"{DATA_API}/trades", {
+            "user": wallet_addr,
+            "limit": min(1000, max_trades - offset),
+            "offset": offset,
+        })
+        if not data or not isinstance(data, list) or len(data) == 0:
+            break
+
+        for t in data:
+            price = float(t.get("price", 0) or 0)
+            size = float(t.get("size", 0) or 0)
+            if price <= 0 or size <= 0:
+                continue
+
+            cid = t.get("conditionId") or t.get("market") or ""
+            mkt = markets_lookup.get(cid, {})
+
+            all_trades.append({
+                "wallet": wallet_addr,
+                "side": t.get("side", "BUY"),
+                "price": price,
+                "size": size,
+                "timestamp": int(t.get("timestamp", 0) or 0),
+                "condition_id": cid,
+                "outcome": t.get("outcome", ""),
+                "title": t.get("title", "") or mkt.get("question", ""),
+                "name": t.get("name", ""),
+                "pseudonym": t.get("pseudonym", ""),
+                "category": mkt.get("category", "other"),
+                "winning_outcome": mkt.get("winning_outcome", ""),
+            })
+
+        offset += len(data)
+        if len(data) < 1000:
+            break
+
+    return all_trades
+
+
+def seed_from_leaderboard(existing_trades, markets_lookup):
+    """
+    Fetch leaderboard wallets' full histories and merge with existing trades.
+    Only fetches history for wallets we don't already have good data on.
+    """
+    logger.info("=" * 50)
+    logger.info("LEADERBOARD SEEDING")
+    logger.info("=" * 50)
+
+    lb_wallets = fetch_leaderboard_wallets(200)
+    if not lb_wallets:
+        logger.info("No leaderboard data returned. Skipping seeding.")
+        return existing_trades
+
+    # Find which wallets we already have enough data for
+    existing_wallet_trades = defaultdict(int)
+    for t in existing_trades:
+        existing_wallet_trades[t["wallet"]] += 1
+
+    new_trades = list(existing_trades)  # Start with existing
+    wallets_seeded = 0
+    wallets_skipped = 0
+
+    for i, wallet in enumerate(lb_wallets):
+        # Skip if we already have 20+ trades for this wallet
+        if existing_wallet_trades.get(wallet, 0) >= 20:
+            wallets_skipped += 1
+            continue
+
+        trades = fetch_wallet_trade_history(wallet, markets_lookup)
+        if trades:
+            new_trades.extend(trades)
+            wallets_seeded += 1
+            logger.debug(f"  Seeded {wallet[:10]}... with {len(trades)} trades")
+
+        if (i + 1) % 20 == 0:
+            state["progress"] = f"Seeding leaderboard: {i+1}/{len(lb_wallets)} wallets ({wallets_seeded} new)..."
+
+    logger.info(f"Seeding complete: {wallets_seeded} new wallets added, {wallets_skipped} already had data")
+    logger.info(f"Total trades now: {len(new_trades)} (was {len(existing_trades)})")
+    return new_trades
 
 
 # ================================================================
@@ -649,6 +806,10 @@ def run_pipeline():
             state["error"] = "No trades fetched."
             return
 
+        # Step 2.5: Seed from Polymarket leaderboard
+        trades = seed_from_leaderboard(trades, markets_lookup)
+        state["trades_analyzed"] = len(trades)
+
         # Step 3: Score wallets
         scored = score_all_wallets(trades, markets_lookup)
         state["scored_wallets"] = scored
@@ -674,6 +835,7 @@ def run_pipeline():
             f"✅ <b>SharpFlow Data Refresh Complete</b>\n\n"
             f"📊 Markets analyzed: {len(markets)}\n"
             f"📈 Trades processed: {len(trades):,}\n"
+            f"🐋 Leaderboard wallets seeded\n"
             f"👛 Wallets scored: {len(scored)}\n"
             f"  ⚡ Elite: {tiers['elite']}\n"
             f"  📊 Sharp: {tiers['sharp']}\n"
@@ -808,18 +970,22 @@ def dashboard():
             wallet_names = ", ".join(w["display_name"] for w in s["wallets"][:4])
             if len(s["wallets"]) > 4:
                 wallet_names += f" +{len(s['wallets'])-4} more"
+            mkt_price = s.get('market_price', 0)
+            notional = s.get('total_notional', 0)
+            notional_fmt = f"${notional:,.0f}" if notional < 1e6 else f"${notional/1e6:,.1f}M"
             signal_rows += f"""
             <tr style="border-bottom:1px solid #1a2a3a">
               <td style="padding:10px 8px;font-size:14px">{emoji}</td>
               <td style="padding:10px 8px;font-size:13px;color:#e8edf2">{s['market_title'][:60]}</td>
               <td style="padding:10px 8px;text-align:center;font-weight:700;color:{'#00f5a0' if s['side']=='YES' else '#f54242'}">{s['side']}</td>
-              <td style="padding:10px 8px;text-align:center;font-family:monospace">{s['wallet_count']} ({s['elite_count']}⚡)</td>
+              <td style="padding:10px 8px;text-align:center;font-family:monospace;font-size:12px;color:#00d4ff">{mkt_price:.0%}</td>
+              <td style="padding:10px 8px;text-align:center;font-family:monospace">{s['wallet_count']} ({s['elite_count']}⚡ {s.get('sharp_count',0)}📊)</td>
               <td style="padding:10px 8px;text-align:center;font-family:monospace">{s['strength']:.2f}</td>
-              <td style="padding:10px 8px;text-align:center;font-family:monospace">{s['agreement_ratio']:.0%}</td>
-              <td style="padding:10px 8px;font-size:11px;color:#5a7a9a">{wallet_names}</td>
+              <td style="padding:10px 8px;text-align:center;font-family:monospace;font-size:12px;color:#f5c842">{notional_fmt}</td>
+              <td style="padding:10px 8px;font-size:11px;color:#5a7a9a" class="desktop-only">{wallet_names}</td>
             </tr>"""
     else:
-        signal_rows = '<tr><td colspan="7" style="padding:20px;text-align:center;color:#3a4a5a">No convergence signals detected yet</td></tr>'
+        signal_rows = '<tr><td colspan="8" style="padding:20px;text-align:center;color:#3a4a5a">No convergence signals detected yet</td></tr>'
 
     # Status banner
     if status == "initializing" or status == "running":
@@ -886,8 +1052,9 @@ def dashboard():
     <table>
       <tr>
         <th style="width:30px"></th><th>Market</th><th style="text-align:center">Side</th>
-        <th style="text-align:center">Wallets</th><th style="text-align:center">Strength</th>
-        <th style="text-align:center">Agreement</th><th class="desktop-only">Sharp Wallets</th>
+        <th style="text-align:center">Price</th><th style="text-align:center">Wallets</th>
+        <th style="text-align:center">Strength</th><th style="text-align:center">$ In</th>
+        <th class="desktop-only">Sharp Wallets</th>
       </tr>
       {signal_rows}
     </table>
