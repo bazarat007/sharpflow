@@ -147,13 +147,39 @@ def fetch_resolved_markets(limit=MARKETS_TO_FETCH):
             tags = [t.get("label", "") if isinstance(t, dict) else str(t)
                     for t in (m.get("tags") or [])]
 
-            # Determine winner from tokens
+            # Determine winner from multiple sources
             winning = None
             tokens = m.get("tokens", [])
             if isinstance(tokens, list):
                 for tok in tokens:
                     if isinstance(tok, dict) and tok.get("winner"):
                         winning = tok.get("outcome", "").lower()
+
+            # Fallback: check outcomePrices (resolved markets show "1" and "0")
+            if not winning:
+                try:
+                    op = m.get("outcomePrices", "")
+                    outcomes = m.get("outcomes", "")
+                    if op and outcomes:
+                        # outcomePrices can be a JSON string like "[\"1\",\"0\"]" or a list
+                        if isinstance(op, str):
+                            op = json.loads(op)
+                        if isinstance(outcomes, str):
+                            outcomes = json.loads(outcomes)
+                        if isinstance(op, list) and isinstance(outcomes, list) and len(op) == len(outcomes):
+                            for price, outcome_name in zip(op, outcomes):
+                                if float(price) >= 0.95:  # This outcome won
+                                    winning = outcome_name.lower()
+                                    break
+                except Exception:
+                    pass
+
+            # Fallback 2: check if market question resolved YES/NO based on resolved field
+            if not winning and m.get("resolved"):
+                # Try to get resolution from the market data
+                res = m.get("resolution", "")
+                if res:
+                    winning = str(res).lower()
 
             cat = categorize(m.get("question", ""), " ".join(tags))
 
@@ -177,7 +203,13 @@ def fetch_resolved_markets(limit=MARKETS_TO_FETCH):
     sp = [m for m in all_markets if m["category"] in ("sports", "politics")]
     other = [m for m in all_markets if m["category"] == "other"]
     result = (sp + other)[:limit]
+
+    # Diagnostic: how many have resolved outcomes?
+    with_winner = sum(1 for m in result if m["winning_outcome"])
+    without_winner = sum(1 for m in result if not m["winning_outcome"])
     logger.info(f"Collected {len(result)} markets ({len(sp)} sports/politics)")
+    logger.info(f"  With resolved outcome: {with_winner} | Without: {without_winner}")
+
     return result
 
 
@@ -193,8 +225,16 @@ def fetch_trades_for_markets(markets):
         })
 
         if data and isinstance(data, list):
+            # Log a sample trade from the first market to see field names
+            if i == 0 and len(data) > 0:
+                sample = data[0]
+                logger.info(f"  Sample trade fields: {list(sample.keys())}")
+                logger.info(f"  Sample trade: wallet={sample.get('proxyWallet', sample.get('maker', sample.get('taker', 'NONE')))}, "
+                           f"outcome={sample.get('outcome','?')}, side={sample.get('side','?')}, "
+                           f"price={sample.get('price','?')}, size={sample.get('size','?')}")
+
             for t in data:
-                wallet = t.get("proxyWallet", "")
+                wallet = t.get("proxyWallet") or t.get("maker") or t.get("taker") or ""
                 price = float(t.get("price", 0) or 0)
                 size = float(t.get("size", 0) or 0)
                 if not wallet or price <= 0 or size <= 0:
@@ -240,6 +280,10 @@ def score_all_wallets(trades, markets_lookup):
     state["wallets_scanned"] = len(wallet_trades)
     results = []
 
+    # Diagnostics
+    skip_reasons = {"below_threshold": 0, "no_win_outcome": 0, "no_clvs": 0, "scored": 0}
+    max_distinct = 0
+
     for wallet, wtrades in wallet_trades.items():
         # Group by market
         market_groups = defaultdict(list)
@@ -247,7 +291,10 @@ def score_all_wallets(trades, markets_lookup):
             market_groups[t["condition_id"]].append(t)
 
         distinct = len(market_groups)
+        max_distinct = max(max_distinct, distinct)
+
         if distinct < MIN_MARKETS:
+            skip_reasons["below_threshold"] += 1
             continue
 
         clvs = []
@@ -293,7 +340,10 @@ def score_all_wallets(trades, markets_lookup):
             market_pnls[cid] = mpnl
 
         if not clvs or trade_count == 0:
+            skip_reasons["no_clvs"] += 1
             continue
+
+        skip_reasons["scored"] += 1
 
         # Component scores
         avg_clv = float(np.mean(clvs))
@@ -351,6 +401,9 @@ def score_all_wallets(trades, markets_lookup):
     for r in results:
         tiers[r["tier"]] += 1
     logger.info(f"Scored {len(results)} wallets: {dict(tiers)}")
+    logger.info(f"  Diagnostics: {dict(skip_reasons)}")
+    logger.info(f"  Max distinct markets any wallet had: {max_distinct}")
+    logger.info(f"  Threshold: {MIN_MARKETS} markets required")
     return results
 
 
