@@ -53,11 +53,11 @@ W_TIMING = 0.25
 W_CONSISTENCY = 0.20
 W_ROI = 0.15
 
-MIN_MARKETS = 15          # Minimum distinct resolved markets to score a wallet
-MARKETS_TO_FETCH = 300    # How many resolved markets to analyze
-TRADES_PER_MARKET = 500   # Max trades per market
-MIN_VOLUME = 5000         # Minimum market volume (USD)
-API_DELAY = 0.35          # Seconds between API calls
+MIN_MARKETS = 8            # Lowered: minimum distinct resolved markets to score a wallet
+MARKETS_TO_FETCH = 750     # Increased: how many resolved markets to analyze
+TRADES_PER_MARKET = 500    # Max trades per market
+MIN_VOLUME = 2000          # Lowered: minimum market volume (USD)
+API_DELAY = 0.3            # Slightly faster
 
 # Category keywords
 SPORTS_KW = ["sports","nfl","nba","mlb","nhl","soccer","football","basketball",
@@ -442,26 +442,83 @@ def score_all_wallets(trades, markets_lookup):
 # ================================================================
 
 def detect_convergence(scored_wallets, trades):
-    """Detect markets where multiple sharp wallets align."""
+    """
+    Detect markets where multiple sharp wallets align.
+    Two sources:
+      1. Historical trades from resolved markets (shows past patterns)
+      2. Current positions on OPEN markets (the actionable signals)
+    """
     logger.info("Detecting convergence signals...")
     state["progress"] = "Detecting convergence..."
 
     sharp_wallets = {w["wallet"]: w for w in scored_wallets if w["sharpness_score"] >= 0.38}
     if not sharp_wallets:
+        logger.info("No sharp wallets found for convergence detection")
         return []
 
-    # Group recent trades by market, only from sharp wallets
-    market_positions = defaultdict(lambda: {"yes": [], "no": []})
+    logger.info(f"Checking current positions for {len(sharp_wallets)} sharp wallets...")
 
+    # ---- Phase 1: Fetch CURRENT positions for sharp wallets on OPEN markets ----
+    market_positions = defaultdict(lambda: {"yes": [], "no": []})
+    market_titles = {}
+    wallets_checked = 0
+
+    for wallet_addr, wdata in sharp_wallets.items():
+        try:
+            # Fetch this wallet's current open positions
+            positions = api_get(f"{DATA_API}/positions", {"user": wallet_addr, "sizeThreshold": 10})
+            if positions and isinstance(positions, list):
+                for pos in positions:
+                    cid = pos.get("conditionId") or pos.get("market") or ""
+                    if not cid:
+                        continue
+
+                    size = float(pos.get("size", 0) or 0)
+                    if size < 5:  # Skip dust positions
+                        continue
+
+                    outcome = (pos.get("outcome", "") or "").lower()
+                    avg_price = float(pos.get("avgPrice", 0) or pos.get("price", 0) or 0)
+                    title = pos.get("title", "") or pos.get("eventTitle", "") or cid[:16]
+
+                    if title:
+                        market_titles[cid] = title
+
+                    entry = {
+                        "wallet": wallet_addr,
+                        "display_name": wdata["display_name"],
+                        "sharpness_score": wdata["sharpness_score"],
+                        "tier": wdata["tier"],
+                        "size": size,
+                        "price": avg_price,
+                    }
+
+                    if outcome in ("yes", "y", "1", ""):
+                        market_positions[cid]["yes"].append(entry)
+                    else:
+                        market_positions[cid]["no"].append(entry)
+
+            wallets_checked += 1
+            if wallets_checked % 5 == 0:
+                state["progress"] = f"Scanning positions: {wallets_checked}/{len(sharp_wallets)} wallets..."
+
+        except Exception as e:
+            logger.debug(f"Failed to fetch positions for {wallet_addr[:10]}: {e}")
+
+    logger.info(f"Scanned {wallets_checked} wallets, found positions in {len(market_positions)} markets")
+
+    # ---- Phase 2: Also add recent trade data from historical trades ----
     for t in trades:
         wallet = t["wallet"]
         if wallet not in sharp_wallets:
             continue
-
         cid = t["condition_id"]
         wdata = sharp_wallets[wallet]
         outcome = t.get("outcome", "").lower()
         side = t.get("side", "BUY")
+        title = t.get("title", "")
+        if title:
+            market_titles[cid] = title
 
         entry = {
             "wallet": wallet,
@@ -472,19 +529,18 @@ def detect_convergence(scored_wallets, trades):
             "price": t["price"],
         }
 
-        # Determine direction
         if side == "BUY":
-            if outcome in ("yes", ""):
+            if outcome in ("yes", "y", "1", ""):
                 market_positions[cid]["yes"].append(entry)
             else:
                 market_positions[cid]["no"].append(entry)
         else:
-            if outcome in ("yes", ""):
+            if outcome in ("yes", "y", "1", ""):
                 market_positions[cid]["no"].append(entry)
             else:
                 market_positions[cid]["yes"].append(entry)
 
-    # Deduplicate (same wallet multiple trades = one entry, keep highest size)
+    # ---- Phase 3: Score convergence ----
     signals = []
     for cid, pos in market_positions.items():
         for direction, wallets in [("YES", pos["yes"]), ("NO", pos["no"])]:
@@ -496,37 +552,35 @@ def detect_convergence(scored_wallets, trades):
                     seen[addr] = w
             unique_wallets = list(seen.values())
 
-            if len(unique_wallets) < 3:
+            if len(unique_wallets) < 2:  # Lowered from 3 to 2 for smaller wallet universe
                 continue
 
             combined_score = sum(w["sharpness_score"] for w in unique_wallets)
-            if combined_score < 1.5:
+            if combined_score < 0.8:  # Lowered from 1.5
                 continue
 
             elite_count = sum(1 for w in unique_wallets if w["tier"] == "elite")
+            sharp_count = sum(1 for w in unique_wallets if w["tier"] == "sharp")
             total_size = sum(w["size"] for w in unique_wallets)
 
-            # Get opposite side
             opp = pos["no"] if direction == "YES" else pos["yes"]
             opp_seen = {}
             for w in opp:
-                addr = w["wallet"]
-                if addr not in opp_seen:
-                    opp_seen[addr] = w
+                if w["wallet"] not in opp_seen:
+                    opp_seen[w["wallet"]] = w
             opp_score = sum(w["sharpness_score"] for w in opp_seen.values())
             agreement = combined_score / (combined_score + opp_score) if (combined_score + opp_score) > 0 else 1.0
 
-            strength = 0.4 * min(1, len(unique_wallets) / 5) + 0.3 * min(1, combined_score / 3) + 0.3 * agreement
+            strength = 0.4 * min(1, len(unique_wallets) / 4) + 0.3 * min(1, combined_score / 2) + 0.3 * agreement
 
-            if elite_count >= 2 and len(unique_wallets) >= 4:
+            if elite_count >= 2 and len(unique_wallets) >= 3:
                 sig_type = "STRONG_CONVERGENCE"
-            elif elite_count >= 1 and len(unique_wallets) >= 3:
+            elif elite_count >= 1 or (sharp_count >= 2 and len(unique_wallets) >= 3):
                 sig_type = "CONVERGENCE"
             else:
                 sig_type = "MILD_CONVERGENCE"
 
-            # Find market title from trades
-            title = next((t["title"] for t in trades if t["condition_id"] == cid and t["title"]), cid[:16])
+            title = market_titles.get(cid, cid[:20])
 
             signals.append({
                 "market_id": cid,
