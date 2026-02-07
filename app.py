@@ -392,9 +392,18 @@ def score_all_wallets(trades, markets_lookup):
 
         sharpness = W_CLV * clv_score + W_TIMING * timing_score + W_CONSISTENCY * consistency_score + W_ROI * roi_score
 
-        # Tier thresholds — tuned for real Polymarket data distributions
-        # Real-world scores cluster lower than synthetic tests
-        tier = "elite" if sharpness >= 0.55 else "sharp" if sharpness >= 0.38 else "average" if sharpness >= 0.22 else "dull"
+        # Tier assignment with sanity checks:
+        # - Elite requires positive PnL AND positive CLV AND 12+ markets
+        # - Sharp requires positive PnL OR (positive CLV with 15+ markets)
+        # - This prevents wallets with high timing/consistency but no actual edge from ranking up
+        if sharpness >= 0.55 and total_pnl > 0 and avg_clv > 0 and distinct >= 12:
+            tier = "elite"
+        elif sharpness >= 0.38 and (total_pnl > 0 or (avg_clv > 0.05 and distinct >= 15)):
+            tier = "sharp"
+        elif sharpness >= 0.22:
+            tier = "average"
+        else:
+            tier = "dull"
 
         sample = wtrades[0]
         name = sample.get("pseudonym") or sample.get("name") or wallet[:12] + "..."
@@ -1016,10 +1025,77 @@ def get_wallets(
 
 @app.get("/api/wallets/{address}")
 def get_wallet(address: str):
+    """Get wallet score data."""
     for w in state["scored_wallets"]:
         if w["wallet"].lower() == address.lower():
             return w
     return {"error": "Wallet not found"}
+
+
+@app.get("/api/wallets/{address}/live")
+def get_wallet_live(address: str):
+    """
+    Get a wallet's CURRENT positions and recent trades.
+    This hits the Polymarket API in real-time for fresh data.
+    """
+    # Get score data
+    score_data = None
+    for w in state["scored_wallets"]:
+        if w["wallet"].lower() == address.lower():
+            score_data = w
+            break
+
+    # Fetch current positions
+    positions_raw = api_get(f"{DATA_API}/positions", {"user": address, "sizeThreshold": 1})
+    positions = []
+    if positions_raw and isinstance(positions_raw, list):
+        for pos in positions_raw:
+            size = float(pos.get("size", 0) or 0)
+            avg_price = float(pos.get("avgPrice", 0) or 0)
+            if size < 1:
+                continue
+            positions.append({
+                "condition_id": pos.get("conditionId", ""),
+                "title": pos.get("title", "") or pos.get("eventTitle", "Unknown"),
+                "outcome": pos.get("outcome", ""),
+                "size": round(size, 2),
+                "avg_price": round(avg_price, 4),
+                "notional": round(size * avg_price, 2),
+                "current_price": float(pos.get("curPrice", 0) or 0),
+            })
+
+    # Sort positions by notional value
+    positions.sort(key=lambda p: p["notional"], reverse=True)
+
+    # Fetch recent trades
+    trades_raw = api_get(f"{DATA_API}/trades", {"user": address, "limit": 50})
+    recent_trades = []
+    if trades_raw and isinstance(trades_raw, list):
+        for t in trades_raw:
+            price = float(t.get("price", 0) or 0)
+            size = float(t.get("size", 0) or 0)
+            if price <= 0 or size <= 0:
+                continue
+            recent_trades.append({
+                "side": t.get("side", "BUY"),
+                "outcome": t.get("outcome", ""),
+                "price": round(price, 4),
+                "size": round(size, 2),
+                "notional": round(price * size, 2),
+                "title": t.get("title", "") or t.get("eventTitle", "Unknown"),
+                "timestamp": int(t.get("timestamp", 0) or 0),
+                "condition_id": t.get("conditionId", ""),
+            })
+
+    return {
+        "wallet": address,
+        "score": score_data,
+        "positions": positions,
+        "position_count": len(positions),
+        "total_position_value": round(sum(p["notional"] for p in positions), 2),
+        "recent_trades": recent_trades,
+        "trade_count": len(recent_trades),
+    }
 
 
 @app.get("/api/convergence")
@@ -1049,6 +1125,163 @@ def get_stats():
     }
 
 
+@app.get("/wallet/{address}", response_class=HTMLResponse)
+def wallet_detail_page(address: str):
+    """Wallet detail page with live positions and recent trades."""
+    # Get score data
+    score = None
+    for w in state["scored_wallets"]:
+        if w["wallet"].lower() == address.lower():
+            score = w
+            break
+
+    if not score:
+        return HTMLResponse(f"""<html><body style="background:#060d14;color:#c5d0de;font-family:sans-serif;padding:40px">
+        <h1>Wallet not found</h1><p>{address}</p><a href="/" style="color:#00d4ff">← Back to dashboard</a></body></html>""")
+
+    tier_color = {"elite": "#00f5a0", "sharp": "#f5c842", "average": "#8a9bb5", "dull": "#f54242"}.get(score["tier"], "#666")
+    tier_badge = {"elite": "⚡ ELITE", "sharp": "📊 SHARP", "average": "⚖️ AVG", "dull": "❌ DULL"}.get(score["tier"], "")
+    pnl_color = "#00f5a0" if score["total_pnl"] >= 0 else "#f54242"
+    pnl_sign = "+" if score["total_pnl"] >= 0 else ""
+
+    # Fetch live data
+    positions_raw = api_get(f"{DATA_API}/positions", {"user": address, "sizeThreshold": 1})
+    position_rows = ""
+    total_pos_value = 0
+    if positions_raw and isinstance(positions_raw, list):
+        positions = []
+        for pos in positions_raw:
+            size = float(pos.get("size", 0) or 0)
+            avg_price = float(pos.get("avgPrice", 0) or 0)
+            if size < 1:
+                continue
+            notional = size * avg_price
+            total_pos_value += notional
+            positions.append((notional, pos))
+
+        positions.sort(key=lambda x: x[0], reverse=True)
+        for notional, pos in positions[:30]:
+            size = float(pos.get("size", 0) or 0)
+            avg_price = float(pos.get("avgPrice", 0) or 0)
+            outcome = pos.get("outcome", "?")
+            title = pos.get("title", "") or pos.get("eventTitle", "Unknown")
+            cur_price = float(pos.get("curPrice", 0) or 0)
+            pnl_est = (cur_price - avg_price) * size if cur_price > 0 else 0
+            pnl_c = "#00f5a0" if pnl_est >= 0 else "#f54242"
+
+            position_rows += f"""
+            <tr style="border-bottom:1px solid #1a2a3a">
+              <td style="padding:8px;font-size:13px;color:#e8edf2;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{title[:55]}</td>
+              <td style="padding:8px;text-align:center;font-weight:700;color:{'#00f5a0' if outcome.lower() in ('yes','y') else '#f54242'}">{outcome}</td>
+              <td style="padding:8px;text-align:right;font-family:monospace;font-size:12px">{size:,.0f}</td>
+              <td style="padding:8px;text-align:right;font-family:monospace;font-size:12px">${avg_price:.2f}</td>
+              <td style="padding:8px;text-align:right;font-family:monospace;font-size:12px;color:#00d4ff">{f'${cur_price:.2f}' if cur_price > 0 else '—'}</td>
+              <td style="padding:8px;text-align:right;font-family:monospace;font-size:12px;color:{pnl_c}">{f'${pnl_est:+,.0f}' if cur_price > 0 else '—'}</td>
+              <td style="padding:8px;text-align:right;font-family:monospace;font-size:12px;color:#f5c842">${notional:,.0f}</td>
+            </tr>"""
+
+    if not position_rows:
+        position_rows = '<tr><td colspan="7" style="padding:20px;text-align:center;color:#3a4a5a">No open positions</td></tr>'
+
+    # Fetch recent trades
+    trades_raw = api_get(f"{DATA_API}/trades", {"user": address, "limit": 30})
+    trade_rows = ""
+    if trades_raw and isinstance(trades_raw, list):
+        for t in trades_raw:
+            price = float(t.get("price", 0) or 0)
+            size = float(t.get("size", 0) or 0)
+            if price <= 0 or size <= 0:
+                continue
+            side = t.get("side", "BUY")
+            outcome = t.get("outcome", "?")
+            title = t.get("title", "Unknown")
+            ts = int(t.get("timestamp", 0) or 0)
+            time_str = datetime.utcfromtimestamp(ts).strftime("%b %d %H:%M") if ts > 0 else "—"
+            side_color = "#00f5a0" if side == "BUY" else "#f54242"
+
+            trade_rows += f"""
+            <tr style="border-bottom:1px solid #1a2a3a">
+              <td style="padding:8px;font-size:11px;color:#3a4a5a">{time_str}</td>
+              <td style="padding:8px;font-weight:700;font-size:12px;color:{side_color}">{side}</td>
+              <td style="padding:8px;font-size:13px;color:#e8edf2;max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{title[:50]}</td>
+              <td style="padding:8px;text-align:center;font-weight:600;color:{'#00f5a0' if outcome.lower() in ('yes','y') else '#f54242'}">{outcome}</td>
+              <td style="padding:8px;text-align:right;font-family:monospace;font-size:12px">${price:.2f}</td>
+              <td style="padding:8px;text-align:right;font-family:monospace;font-size:12px">{size:,.0f}</td>
+              <td style="padding:8px;text-align:right;font-family:monospace;font-size:12px;color:#f5c842">${price*size:,.0f}</td>
+            </tr>"""
+
+    if not trade_rows:
+        trade_rows = '<tr><td colspan="7" style="padding:20px;text-align:center;color:#3a4a5a">No recent trades</td></tr>'
+
+    return f"""<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{score['display_name']} — SharpFlow</title>
+<style>
+  * {{ box-sizing:border-box; margin:0; padding:0; }}
+  body {{ background:#060d14; color:#c5d0de; font-family:-apple-system,system-ui,sans-serif; }}
+  table {{ width:100%; border-collapse:collapse; }}
+  th {{ text-align:left; padding:8px; font-size:10px; font-weight:700; color:#3a4a5a; letter-spacing:1.5px; text-transform:uppercase; border-bottom:2px solid #1a2a3a; }}
+  .card {{ background:#0a1018; border:1px solid #1a2a3a; border-radius:8px; padding:16px; }}
+  .stat {{ text-align:center; }}
+  .stat .val {{ font-size:24px; font-weight:800; font-family:monospace; }}
+  .stat .lbl {{ font-size:10px; color:#3a4a5a; letter-spacing:1px; margin-top:4px; }}
+  a {{ color:#00d4ff; text-decoration:none; }}
+</style>
+</head><body>
+<div style="max-width:1200px;margin:0 auto;padding:20px">
+
+  <a href="/" style="font-size:12px;color:#3a4a5a">← Back to leaderboard</a>
+
+  <div style="display:flex;align-items:center;gap:16px;margin:16px 0 20px 0;flex-wrap:wrap">
+    <div>
+      <h1 style="font-size:24px;font-weight:800;color:#e8edf2">{score['display_name']}</h1>
+      <div style="font-size:12px;color:#3a4a5a;font-family:monospace">{address}</div>
+    </div>
+    <span style="background:{tier_color}18;color:{tier_color};padding:4px 12px;border-radius:6px;font-size:13px;font-weight:700">{tier_badge}</span>
+  </div>
+
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(100px,1fr));gap:10px;margin-bottom:24px">
+    <div class="card stat"><div class="val" style="color:{tier_color}">{score['sharpness_score']*100:.0f}</div><div class="lbl">SCORE</div></div>
+    <div class="card stat"><div class="val" style="color:#00d4ff">{score['avg_clv']:+.3f}</div><div class="lbl">AVG CLV</div></div>
+    <div class="card stat"><div class="val" style="color:#a855f7">{score['early_entry_pct']:.0%}</div><div class="lbl">EARLY ENTRY</div></div>
+    <div class="card stat"><div class="val">{score['win_rate']:.0%}</div><div class="lbl">WIN RATE</div></div>
+    <div class="card stat"><div class="val" style="color:{pnl_color}">{pnl_sign}${abs(score['total_pnl']):,.0f}</div><div class="lbl">PNL</div></div>
+    <div class="card stat"><div class="val" style="color:#5a7a9a">{score['distinct_markets']}</div><div class="lbl">MARKETS</div></div>
+    <div class="card stat"><div class="val" style="color:#5a7a9a">{score['total_trades']}</div><div class="lbl">TRADES</div></div>
+    <div class="card stat"><div class="val" style="color:#f5c842">${total_pos_value:,.0f}</div><div class="lbl">OPEN VALUE</div></div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:24px">
+    <div class="card stat"><div class="val" style="font-size:16px;color:#00d4ff">{score['clv_score']:.2f}</div><div class="lbl">CLV (40%)</div></div>
+    <div class="card stat"><div class="val" style="font-size:16px;color:#a855f7">{score['timing_score']:.2f}</div><div class="lbl">TIMING (25%)</div></div>
+    <div class="card stat"><div class="val" style="font-size:16px;color:#f5c842">{score['consistency_score']:.2f}</div><div class="lbl">CONSIST (20%)</div></div>
+    <div class="card stat"><div class="val" style="font-size:16px;color:#00f5a0">{score['roi_score']:.2f}</div><div class="lbl">ROI (15%)</div></div>
+  </div>
+
+  <h2 style="font-size:14px;font-weight:700;color:#f5c842;margin-bottom:10px;letter-spacing:1px">📂 CURRENT POSITIONS</h2>
+  <div class="card" style="margin-bottom:24px;overflow-x:auto">
+    <table>
+      <tr><th>Market</th><th style="text-align:center">Side</th><th style="text-align:right">Shares</th><th style="text-align:right">Entry</th><th style="text-align:right">Current</th><th style="text-align:right">Est P&L</th><th style="text-align:right">Value</th></tr>
+      {position_rows}
+    </table>
+  </div>
+
+  <h2 style="font-size:14px;font-weight:700;color:#00d4ff;margin-bottom:10px;letter-spacing:1px">📋 RECENT TRADES</h2>
+  <div class="card" style="overflow-x:auto">
+    <table>
+      <tr><th>Time</th><th>Side</th><th>Market</th><th style="text-align:center">Outcome</th><th style="text-align:right">Price</th><th style="text-align:right">Shares</th><th style="text-align:right">Value</th></tr>
+      {trade_rows}
+    </table>
+  </div>
+
+  <div style="margin-top:30px;padding:16px;text-align:center;font-size:11px;color:#2a3a4a;border-top:1px solid #111b26">
+    SharpFlow v1.0 · Data fetched live from Polymarket
+  </div>
+</div>
+</body></html>"""
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
     """Serve a built-in dashboard — no separate frontend needed."""
@@ -1070,7 +1303,7 @@ def dashboard():
         wallet_short = w["wallet"][:8] + "..." + w["wallet"][-4:]
 
         wallet_rows += f"""
-        <tr onclick="this.querySelector('.detail-row')?.classList.toggle('hidden')" style="cursor:pointer;border-bottom:1px solid #1a2a3a">
+        <tr onclick="window.location='/wallet/{w['wallet']}'" style="cursor:pointer;border-bottom:1px solid #1a2a3a" onmouseover="this.style.background='#0d1520'" onmouseout="this.style.background='none'">
           <td style="padding:10px 8px;color:#5a7a9a;font-size:13px">#{w['rank']}</td>
           <td style="padding:10px 8px">
             <div style="font-weight:600;color:#e8edf2;font-size:14px">{w['display_name']}</div>
@@ -1220,7 +1453,7 @@ def background_pipeline():
 
     # Schedule refreshes every 12 hours
     while True:
-        time.sleep(12 * 3600)  # 12 hours
+        time.sleep(3 * 3600)  # 3 hours
         logger.info("Running scheduled refresh...")
         run_pipeline()
 
