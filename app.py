@@ -1166,21 +1166,192 @@ def seed_from_leaderboard(existing_trades, markets_lookup):
 
 
 # ================================================================
-# TELEGRAM (OPTIONAL)
+# TELEGRAM ALERTS
 # ================================================================
 
 def tg_send(text):
     """Send a Telegram message if configured."""
     if not TG_TOKEN or not TG_CHAT:
-        return
+        return False
     try:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             json={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
             timeout=10,
         )
+        return r.status_code == 200
     except Exception as e:
         logger.error(f"Telegram error: {e}")
+        return False
+
+
+def alert_convergence(signals):
+    """Alert 1: New convergence signal (3+ sharps align on open market)."""
+    if not signals:
+        return
+    for s in signals[:5]:  # Max 5 alerts per refresh
+        wallets = ", ".join(w["display_name"] for w in s["wallets"][:4])
+        emoji = {"STRONG_CONVERGENCE": "🔴", "CONVERGENCE": "🟡", "MILD_CONVERGENCE": "🟢"}.get(s["signal_type"], "⚪")
+        tg_send(
+            f"{emoji} <b>CONVERGENCE SIGNAL</b>\n\n"
+            f"📊 <b>{s['market_title'][:70]}</b>\n"
+            f"📍 Direction: <b>{s['side']}</b>\n"
+            f"👛 {s['wallet_count']} sharp wallets ({s['elite_count']}⚡ elite)\n"
+            f"💪 Strength: {s['strength']:.2f}\n"
+            f"💰 Combined: ${s.get('total_notional', 0):,.0f}\n"
+            f"📈 Market price: {s.get('market_price', 0):.0%}\n\n"
+            f"🔍 Wallets: {wallets}"
+        )
+
+
+def alert_high_divergence(intel_markets):
+    """Alert 2: High divergence market (sharp vs dull disagree with big price gap)."""
+    if not intel_markets:
+        return
+
+    # Get previously alerted markets to avoid repeats
+    prev_alerted = state.get("_alerted_divergence", set())
+    new_alerted = set()
+
+    for m in intel_markets:
+        cid = m["condition_id"]
+        # Only alert if: divergence >= 30%, price gap >= 8%, and at least 2 sharp wallets
+        if (m["divergence"] >= 0.30 and abs(m["price_gap"]) >= 0.08
+                and (m["sharp_yes_count"] + m["sharp_no_count"]) >= 2):
+
+            if cid in prev_alerted:
+                new_alerted.add(cid)
+                continue  # Already alerted this market
+
+            new_alerted.add(cid)
+            gap = m["price_gap"]
+            direction = "underpriced" if gap > 0 else "overpriced"
+
+            sharp_side = "YES" if m["smart_money_yes_pct"] > 0.5 else "NO"
+            dull_side = "YES" if m["dull_money_yes_pct"] > 0.5 else "NO"
+
+            tg_send(
+                f"⚡ <b>SHARP/DULL DIVERGENCE</b>\n\n"
+                f"📊 <b>{m['question'][:70]}</b>\n\n"
+                f"🧠 Sharp money: <b>{sharp_side}</b> ({m['smart_money_yes_pct']:.0%} YES)\n"
+                f"🐑 Dull money: <b>{dull_side}</b> ({m['dull_money_yes_pct']:.0%} YES)\n"
+                f"📍 Divergence: <b>{m['divergence']:.0%}</b>\n\n"
+                f"💹 Market price: {m['market_price']:.0%}\n"
+                f"📐 Price gap: <b>{gap:+.0%}</b> (YES looks {direction})\n"
+                f"👛 {m['sharp_yes_count']} sharp YES · {m['sharp_no_count']} sharp NO\n"
+                f"💰 Sharp capital: ${m['sharp_yes_notional'] + m['sharp_no_notional']:,.0f}"
+            )
+
+    state["_alerted_divergence"] = new_alerted
+
+
+def alert_elite_moves(scored_wallets):
+    """Alert 3: Elite wallet takes a large new position (>$500 notional)."""
+    elite_wallets = [w for w in scored_wallets if w["tier"] == "elite"]
+    if not elite_wallets:
+        return
+
+    # Track previously seen positions to detect new ones
+    prev_positions = state.get("_elite_positions", {})
+    current_positions = {}
+
+    for wdata in elite_wallets:
+        wallet_addr = wdata["wallet"]
+        try:
+            positions = api_get(f"{DATA_API}/positions", {"user": wallet_addr, "sizeThreshold": 10})
+            if not positions or not isinstance(positions, list):
+                continue
+
+            for pos in positions:
+                cid = pos.get("conditionId") or pos.get("market") or ""
+                size = float(pos.get("size", 0) or 0)
+                avg_price = float(pos.get("avgPrice", 0) or 0)
+                notional = size * avg_price
+                if notional < 500:
+                    continue
+
+                pos_key = f"{wallet_addr}:{cid}"
+                current_positions[pos_key] = notional
+
+                # Alert if this is a NEW position we haven't seen before
+                if pos_key not in prev_positions:
+                    outcome = pos.get("outcome", "?")
+                    title = pos.get("title", "") or pos.get("eventTitle", "Unknown market")
+
+                    tg_send(
+                        f"🐋 <b>ELITE WALLET MOVE</b>\n\n"
+                        f"👛 <b>{wdata['display_name']}</b> (Score: {wdata['sharpness_score']*100:.0f})\n"
+                        f"📊 {title[:70]}\n"
+                        f"📍 Side: <b>{outcome}</b>\n"
+                        f"💰 Position: <b>${notional:,.0f}</b>\n"
+                        f"📈 Avg entry: ${avg_price:.2f}"
+                    )
+                # Alert if position grew significantly (>50% increase)
+                elif notional > prev_positions[pos_key] * 1.5:
+                    outcome = pos.get("outcome", "?")
+                    title = pos.get("title", "") or pos.get("eventTitle", "Unknown market")
+                    prev_val = prev_positions[pos_key]
+
+                    tg_send(
+                        f"🐋 <b>ELITE ADDING TO POSITION</b>\n\n"
+                        f"👛 <b>{wdata['display_name']}</b> (Score: {wdata['sharpness_score']*100:.0f})\n"
+                        f"📊 {title[:70]}\n"
+                        f"📍 Side: <b>{outcome}</b>\n"
+                        f"💰 ${prev_val:,.0f} → <b>${notional:,.0f}</b> (+{(notional/prev_val-1)*100:.0f}%)"
+                    )
+
+        except Exception as e:
+            logger.debug(f"Failed scanning elite {wallet_addr[:10]}: {e}")
+
+    state["_elite_positions"] = current_positions
+
+
+def send_daily_digest(scored_wallets, intel_markets, signals):
+    """Alert 4: Daily summary digest — sent once per day."""
+    last_digest = state.get("_last_digest_date", "")
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    if last_digest == today:
+        return  # Already sent today
+
+    tiers = defaultdict(int)
+    for w in scored_wallets:
+        tiers[w["tier"]] += 1
+
+    # Top 3 markets by interest
+    top_markets = ""
+    if intel_markets:
+        for i, m in enumerate(intel_markets[:3], 1):
+            gap = m["price_gap"]
+            top_markets += (
+                f"\n{i}. <b>{m['question'][:50]}</b>"
+                f"\n   Smart $: {'YES' if m['smart_money_yes_pct'] > 0.5 else 'NO'} "
+                f"({m['smart_money_yes_pct']:.0%}) · Gap: {gap:+.0%} · "
+                f"Div: {m['divergence']:.0%}"
+            )
+    else:
+        top_markets = "\n   No market intel data yet"
+
+    # New elite/sharp wallets (scored recently)
+    recent_sharps = [w for w in scored_wallets
+                     if w["tier"] in ("elite", "sharp")
+                     and w.get("scored_at", "").startswith(today)]
+
+    tg_send(
+        f"📋 <b>SHARPFLOW DAILY DIGEST</b>\n"
+        f"📅 {today}\n\n"
+        f"<b>System Status</b>\n"
+        f"👛 {len(scored_wallets)} wallets scored\n"
+        f"   ⚡ {tiers['elite']} Elite · 📊 {tiers['sharp']} Sharp\n"
+        f"   ⚖️ {tiers['average']} Average · ❌ {tiers['dull']} Dull\n"
+        f"🎯 {len(signals)} convergence signals\n"
+        f"📊 {len(intel_markets)} markets tracked\n\n"
+        f"<b>Top Markets by Smart Money Interest</b>"
+        f"{top_markets}\n\n"
+        f"{'🆕 ' + str(len(recent_sharps)) + ' new sharp+ wallets today' if recent_sharps else ''}"
+        f"🔗 Check dashboard for full details"
+    )
+
+    state["_last_digest_date"] = today
 
 
 # ================================================================
@@ -1236,24 +1407,22 @@ def run_pipeline():
         logger.info(f"Pipeline complete in {elapsed/60:.1f} minutes")
         logger.info(f"  Markets: {len(markets)} | Trades: {len(trades)} | Wallets scored: {len(scored)} | Convergence: {len(signals)} | Market intel: {len(intel)}")
 
-        # Send Telegram notification
-        tiers = defaultdict(int)
-        for w in scored:
-            tiers[w["tier"]] += 1
+        # ---- TELEGRAM ALERTS ----
+        logger.info("Running alert checks...")
 
-        tg_send(
-            f"✅ <b>SharpFlow Data Refresh Complete</b>\n\n"
-            f"📊 Markets analyzed: {len(markets)}\n"
-            f"📈 Trades processed: {len(trades):,}\n"
-            f"🐋 Leaderboard wallets seeded\n"
-            f"👛 Wallets scored: {len(scored)}\n"
-            f"  ⚡ Elite: {tiers['elite']}\n"
-            f"  📊 Sharp: {tiers['sharp']}\n"
-            f"  ⚖️ Average: {tiers['average']}\n"
-            f"  ❌ Dull: {tiers['dull']}\n"
-            f"🎯 Convergence signals: {len(signals)}\n"
-            f"⏱ Time: {elapsed/60:.1f} min"
-        )
+        # Alert 1: Convergence signals
+        alert_convergence(signals)
+
+        # Alert 2: High divergence markets
+        alert_high_divergence(intel)
+
+        # Alert 3: Elite wallet moves
+        alert_elite_moves(scored)
+
+        # Alert 4: Daily digest (once per day)
+        send_daily_digest(scored, intel, signals)
+
+        logger.info("Alert checks complete")
 
     except Exception as e:
         logger.error(f"Pipeline error: {e}", exc_info=True)
@@ -1265,8 +1434,26 @@ def run_pipeline():
 # FASTAPI APP
 # ================================================================
 
-app = FastAPI(title="SharpFlow", version="1.0.0")
+app = FastAPI(title="SharpFlow", version="1.5.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+@app.get("/api/test-telegram")
+def test_telegram():
+    """Send a test message to verify Telegram is connected."""
+    if not TG_TOKEN or not TG_CHAT:
+        return {"status": "error", "message": "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID not set in environment variables"}
+    success = tg_send(
+        f"✅ <b>SharpFlow Telegram Connected!</b>\n\n"
+        f"You'll receive alerts for:\n"
+        f"🎯 Convergence signals (3+ sharps align)\n"
+        f"⚡ High divergence markets (sharp vs dull disagree)\n"
+        f"🐋 Elite wallet moves (>$500 positions)\n"
+        f"📋 Daily digest summary"
+    )
+    if success:
+        return {"status": "ok", "message": "Test message sent! Check your Telegram."}
+    return {"status": "error", "message": "Failed to send. Check your bot token and chat ID."}
 
 
 @app.get("/api/wallets")
@@ -1997,7 +2184,7 @@ def background_pipeline():
 
     # Schedule refreshes every 12 hours
     while True:
-        time.sleep(3 * 3600)  # 3 hours
+        time.sleep(1 * 3600)  # 1 hour
         logger.info("Running scheduled refresh...")
         run_pipeline()
 
