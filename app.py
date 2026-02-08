@@ -2457,15 +2457,27 @@ def run_backfill(max_markets=10000, min_volume=500):
         # Step 5: Fetch trades for new markets and save in batches
         batch_trades = []
         batch_size = 20  # Save to DB every 20 markets
+        empty_markets = 0
 
         for i, mkt in enumerate(new_markets):
             cid = mkt["condition_id"]
             try:
+                # Try both parameter names
                 data = api_get(f"{DATA_API}/trades", {
                     "market": cid, "limit": TRADES_PER_MARKET,
                 })
 
-                if data and isinstance(data, list):
+                # If empty, try with conditionId parameter
+                if not data or (isinstance(data, list) and len(data) == 0):
+                    data = api_get(f"{DATA_API}/trades", {
+                        "conditionId": cid, "limit": TRADES_PER_MARKET,
+                    })
+
+                # Log first few results for diagnostics
+                if i < 3:
+                    logger.info(f"  Backfill diag: market {cid[:16]}... returned {len(data) if isinstance(data, list) else type(data)}")
+
+                if data and isinstance(data, list) and len(data) > 0:
                     for t in data:
                         wallet = t.get("proxyWallet") or t.get("maker") or t.get("taker") or ""
                         price = float(t.get("price", 0) or 0)
@@ -2485,6 +2497,8 @@ def run_backfill(max_markets=10000, min_volume=500):
                             "category": mkt["category"],
                             "winning_outcome": mkt["winning_outcome"],
                         })
+                else:
+                    empty_markets += 1
 
             except Exception as e:
                 logger.debug(f"Backfill trade fetch error for {cid[:12]}: {e}")
@@ -2504,7 +2518,7 @@ def run_backfill(max_markets=10000, min_volume=500):
                 backfill_state["progress"] = (
                     f"Processing: {i+1}/{len(new_markets)} new markets "
                     f"({backfill_state['trades_ingested']:,} trades ingested, "
-                    f"{backfill_state['errors']} errors)"
+                    f"{empty_markets} empty, {backfill_state['errors']} errors)"
                 )
 
             # Brief pause to avoid rate limiting
