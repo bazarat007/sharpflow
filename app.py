@@ -93,6 +93,7 @@ TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 state = {
     "scored_wallets": [],
     "convergence_signals": [],
+    "market_intelligence": [],
     "markets_analyzed": 0,
     "trades_analyzed": 0,
     "wallets_scanned": 0,
@@ -765,6 +766,276 @@ def detect_convergence(scored_wallets, trades):
 
 
 # ================================================================
+# MARKET INTELLIGENCE
+# ================================================================
+
+def compute_market_intelligence(scored_wallets):
+    """
+    For every open market with sharp wallet activity, compute:
+      - Smart money direction (weighted YES vs NO)
+      - Dull money direction
+      - Sharp/Dull divergence score
+      - Price gap (market price vs smart money implied price)
+    
+    This is the core "should I bet on this" view.
+    """
+    logger.info("Computing market intelligence...")
+    state["progress"] = "Computing market intelligence..."
+
+    # Build wallet lookup by tier
+    wallet_lookup = {w["wallet"]: w for w in scored_wallets}
+    sharp_addrs = {w["wallet"] for w in scored_wallets if w["tier"] in ("elite", "sharp")}
+    dull_addrs = {w["wallet"] for w in scored_wallets if w["tier"] == "dull"}
+    avg_addrs = {w["wallet"] for w in scored_wallets if w["tier"] == "average"}
+
+    # Fetch open markets
+    state["progress"] = "Fetching open markets..."
+    open_markets = {}
+    offset = 0
+    while True:
+        data = api_get(f"{GAMMA_API}/markets", {
+            "closed": "false", "limit": 100, "offset": offset,
+            "order": "volume", "ascending": "false",
+        })
+        if not data or not isinstance(data, list) or len(data) == 0:
+            break
+        for m in data:
+            cid = m.get("conditionId") or m.get("condition_id") or ""
+            if not cid:
+                continue
+            vol = float(m.get("volume", 0) or 0)
+            if vol < 1000:
+                continue
+
+            # Get current price
+            yes_price = 0.5
+            tokens = m.get("tokens", [])
+            if isinstance(tokens, list):
+                for tok in tokens:
+                    if isinstance(tok, dict):
+                        tp = float(tok.get("price", 0) or 0)
+                        outcome = (tok.get("outcome", "") or "").lower()
+                        if tp > 0 and outcome in ("yes", "y"):
+                            yes_price = tp
+
+            q = m.get("question", "")
+            open_markets[cid] = {
+                "condition_id": cid,
+                "question": q,
+                "slug": m.get("slug", ""),
+                "volume": vol,
+                "yes_price": yes_price,
+                "category": categorize(q, " ".join(
+                    t.get("label", "") if isinstance(t, dict) else str(t)
+                    for t in (m.get("tags") or [])
+                )),
+                "end_date": m.get("endDate", ""),
+            }
+        offset += 100
+        if len(data) < 100 or offset >= 1500:
+            break
+
+    logger.info(f"Found {len(open_markets)} open markets")
+
+    # Skip dead-priced markets
+    active_markets = {cid: m for cid, m in open_markets.items()
+                      if 0.05 < m["yes_price"] < 0.95}
+    logger.info(f"Active (price 5-95%): {len(active_markets)} markets")
+
+    # Scan positions for ALL scored wallets (not just sharp) to get dull money too
+    state["progress"] = "Scanning wallet positions for market intelligence..."
+    market_positions = defaultdict(lambda: {
+        "sharp_yes": [], "sharp_no": [],
+        "dull_yes": [], "dull_no": [],
+        "avg_yes": [], "avg_no": [],
+    })
+
+    wallets_to_scan = [w for w in scored_wallets if w["tier"] in ("elite", "sharp", "dull")]
+    # Limit dull wallet scanning to top 100 by trade count (most active)
+    dull_wallets = sorted([w for w in scored_wallets if w["tier"] == "dull"],
+                          key=lambda w: w["total_trades"], reverse=True)[:100]
+    sharp_wallets_list = [w for w in scored_wallets if w["tier"] in ("elite", "sharp")]
+    scan_list = sharp_wallets_list + dull_wallets
+
+    scanned = 0
+    for wdata in scan_list:
+        wallet_addr = wdata["wallet"]
+        try:
+            positions = api_get(f"{DATA_API}/positions", {"user": wallet_addr, "sizeThreshold": 10})
+            if not positions or not isinstance(positions, list):
+                continue
+
+            for pos in positions:
+                cid = pos.get("conditionId") or pos.get("market") or ""
+                if cid not in active_markets:
+                    continue
+
+                size = float(pos.get("size", 0) or 0)
+                avg_price = float(pos.get("avgPrice", 0) or 0)
+                notional = size * avg_price
+                if notional < 20:
+                    continue
+
+                outcome = (pos.get("outcome", "") or "").lower()
+                tier = wdata["tier"]
+
+                entry = {
+                    "wallet": wallet_addr,
+                    "display_name": wdata["display_name"],
+                    "tier": tier,
+                    "sharpness_score": wdata["sharpness_score"],
+                    "size": size,
+                    "avg_price": avg_price,
+                    "notional": round(notional, 2),
+                }
+
+                is_yes = outcome in ("yes", "y", "1", "")
+
+                if tier in ("elite", "sharp"):
+                    if is_yes:
+                        market_positions[cid]["sharp_yes"].append(entry)
+                    else:
+                        market_positions[cid]["sharp_no"].append(entry)
+                elif tier == "dull":
+                    if is_yes:
+                        market_positions[cid]["dull_yes"].append(entry)
+                    else:
+                        market_positions[cid]["dull_no"].append(entry)
+
+            scanned += 1
+            if scanned % 10 == 0:
+                state["progress"] = f"Market intel: scanned {scanned}/{len(scan_list)} wallets..."
+
+        except Exception as e:
+            logger.debug(f"Failed scanning {wallet_addr[:10]}: {e}")
+
+    logger.info(f"Scanned {scanned} wallets, found activity in {len(market_positions)} open markets")
+
+    # Compute intelligence for each market
+    intel_results = []
+    for cid, pos in market_positions.items():
+        mkt = active_markets.get(cid)
+        if not mkt:
+            continue
+
+        # Deduplicate within each group
+        def dedup(entries):
+            seen = {}
+            for e in entries:
+                addr = e["wallet"]
+                if addr not in seen or e["notional"] > seen[addr]["notional"]:
+                    seen[addr] = e
+            return list(seen.values())
+
+        sy = dedup(pos["sharp_yes"])
+        sn = dedup(pos["sharp_no"])
+        dy = dedup(pos["dull_yes"])
+        dn = dedup(pos["dull_no"])
+
+        # Need at least 1 sharp wallet to be interesting
+        total_sharp = len(sy) + len(sn)
+        if total_sharp == 0:
+            continue
+
+        # Compute weighted scores (sharpness-weighted capital)
+        sharp_yes_score = sum(e["sharpness_score"] * e["notional"] for e in sy)
+        sharp_no_score = sum(e["sharpness_score"] * e["notional"] for e in sn)
+        sharp_total_score = sharp_yes_score + sharp_no_score
+
+        dull_yes_notional = sum(e["notional"] for e in dy)
+        dull_no_notional = sum(e["notional"] for e in dn)
+        dull_total = dull_yes_notional + dull_no_notional
+
+        # Smart money direction: what % of sharp-weighted capital is on YES
+        if sharp_total_score > 0:
+            smart_money_yes_pct = sharp_yes_score / sharp_total_score
+        else:
+            smart_money_yes_pct = 0.5  # No data = neutral
+
+        # Dull money direction
+        if dull_total > 0:
+            dull_money_yes_pct = dull_yes_notional / dull_total
+        else:
+            dull_money_yes_pct = 0.5
+
+        # Smart money implied price (what sharps think this market is worth)
+        smart_implied = smart_money_yes_pct
+
+        # Price gap: difference between market price and smart money implied
+        market_price = mkt["yes_price"]
+        price_gap = smart_implied - market_price  # Positive = sharps think YES is underpriced
+
+        # Divergence: how much do sharp and dull disagree?
+        # 0 = same direction, 1 = completely opposite
+        divergence = abs(smart_money_yes_pct - dull_money_yes_pct)
+
+        # Interest score: combination of sharp conviction, divergence, and price gap
+        sharp_conviction = abs(smart_money_yes_pct - 0.5) * 2  # 0 = split, 1 = unanimous
+        interest_score = (
+            0.35 * sharp_conviction +            # How strongly sharps agree
+            0.25 * divergence +                    # How much sharp/dull disagree
+            0.25 * min(1, abs(price_gap) / 0.20) + # How big the price gap is
+            0.15 * min(1, total_sharp / 5)         # How many sharps are involved
+        )
+
+        # Determine signal direction
+        if smart_money_yes_pct > 0.65:
+            smart_direction = "YES"
+            direction_strength = smart_money_yes_pct
+        elif smart_money_yes_pct < 0.35:
+            smart_direction = "NO"
+            direction_strength = 1 - smart_money_yes_pct
+        else:
+            smart_direction = "SPLIT"
+            direction_strength = 0.5
+
+        # Count elites
+        elite_yes = [e for e in sy if e["tier"] == "elite"]
+        elite_no = [e for e in sn if e["tier"] == "elite"]
+
+        intel_results.append({
+            "condition_id": cid,
+            "question": mkt["question"],
+            "slug": mkt["slug"],
+            "category": mkt["category"],
+            "volume": mkt["volume"],
+            "market_price": round(market_price, 3),
+
+            # Smart money
+            "smart_direction": smart_direction,
+            "smart_money_yes_pct": round(smart_money_yes_pct, 3),
+            "smart_implied_price": round(smart_implied, 3),
+            "sharp_yes_count": len(sy),
+            "sharp_no_count": len(sn),
+            "sharp_yes_notional": round(sum(e["notional"] for e in sy), 2),
+            "sharp_no_notional": round(sum(e["notional"] for e in sn), 2),
+            "elite_yes": len(elite_yes),
+            "elite_no": len(elite_no),
+            "sharp_wallets_yes": sorted(sy, key=lambda e: e["sharpness_score"], reverse=True)[:5],
+            "sharp_wallets_no": sorted(sn, key=lambda e: e["sharpness_score"], reverse=True)[:5],
+
+            # Dull money
+            "dull_money_yes_pct": round(dull_money_yes_pct, 3),
+            "dull_yes_count": len(dy),
+            "dull_no_count": len(dn),
+            "dull_yes_notional": round(dull_yes_notional, 2),
+            "dull_no_notional": round(dull_no_notional, 2),
+
+            # Signals
+            "price_gap": round(price_gap, 3),
+            "divergence": round(divergence, 3),
+            "sharp_conviction": round(sharp_conviction, 3),
+            "interest_score": round(interest_score, 4),
+        })
+
+    # Sort by interest score (most interesting markets first)
+    intel_results.sort(key=lambda m: m["interest_score"], reverse=True)
+
+    logger.info(f"Market intelligence: {len(intel_results)} markets with sharp wallet activity")
+    return intel_results
+
+
+# ================================================================
 # LEADERBOARD SEEDING
 # ================================================================
 
@@ -953,13 +1224,17 @@ def run_pipeline():
         signals = detect_convergence(scored, trades)
         state["convergence_signals"] = signals
 
+        # Step 5: Compute market intelligence
+        intel = compute_market_intelligence(scored)
+        state["market_intelligence"] = intel
+
         elapsed = time.time() - start
         state["status"] = "ready"
         state["last_refresh"] = datetime.utcnow().isoformat()
-        state["progress"] = f"Complete! {len(scored)} wallets scored in {elapsed/60:.1f} min"
+        state["progress"] = f"Complete! {len(scored)} wallets scored, {len(intel)} markets analyzed in {elapsed/60:.1f} min"
 
         logger.info(f"Pipeline complete in {elapsed/60:.1f} minutes")
-        logger.info(f"  Markets: {len(markets)} | Trades: {len(trades)} | Wallets scored: {len(scored)} | Convergence signals: {len(signals)}")
+        logger.info(f"  Markets: {len(markets)} | Trades: {len(trades)} | Wallets scored: {len(scored)} | Convergence: {len(signals)} | Market intel: {len(intel)}")
 
         # Send Telegram notification
         tiers = defaultdict(int)
@@ -1106,6 +1381,26 @@ def get_convergence(min_strength: float = Query(0.0)):
     return {"signals": signals, "total": len(signals)}
 
 
+@app.get("/api/markets")
+def get_market_intelligence(limit: int = Query(50, ge=1, le=200)):
+    """
+    Market Intelligence endpoint.
+    Returns open markets ranked by how interesting the smart money positioning is.
+    For each market: sharp money direction, dull money direction, divergence score.
+    """
+    return {"markets": state.get("market_intelligence", [])[:limit],
+            "total": len(state.get("market_intelligence", []))}
+
+
+@app.get("/api/markets/{condition_id}")
+def get_single_market_intel(condition_id: str):
+    """Get smart money breakdown for a specific market."""
+    for m in state.get("market_intelligence", []):
+        if m["condition_id"] == condition_id:
+            return m
+    return {"error": "Market not found in intelligence data"}
+
+
 @app.get("/api/stats")
 def get_stats():
     tiers = defaultdict(int)
@@ -1120,6 +1415,7 @@ def get_stats():
         "wallets_scored": len(state["scored_wallets"]),
         "tiers": dict(tiers),
         "convergence_signals": len(state["convergence_signals"]),
+        "markets_with_intel": len(state.get("market_intelligence", [])),
         "last_refresh": state["last_refresh"],
         "error": state["error"],
     }
@@ -1282,6 +1578,193 @@ def wallet_detail_page(address: str):
 </body></html>"""
 
 
+@app.get("/markets", response_class=HTMLResponse)
+def markets_page():
+    """Market Intelligence page — smart money positioning across open markets."""
+    intel = state.get("market_intelligence", [])
+    status = state["status"]
+
+    if status != "ready" or not intel:
+        return HTMLResponse(f"""<!DOCTYPE html><html><head>
+        <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+        <title>Markets — SharpFlow</title>
+        <style>body {{ background:#060d14;color:#c5d0de;font-family:sans-serif;padding:40px; }}</style>
+        </head><body>
+        <a href="/" style="color:#00d4ff;text-decoration:none;font-size:12px">← Dashboard</a>
+        <h1 style="margin-top:16px;color:#e8edf2">Market Intelligence</h1>
+        <p style="margin-top:20px;color:#3a4a5a">{'Pipeline is still running...' if status != 'ready' else 'No market intelligence data yet. Wait for the next pipeline refresh.'}</p>
+        </body></html>""")
+
+    market_cards = ""
+    for m in intel[:40]:
+        # Smart money direction indicator
+        sy_pct = m["smart_money_yes_pct"]
+        gap = m["price_gap"]
+        div = m["divergence"]
+        mkt_price = m["market_price"]
+
+        # Color and arrow for smart direction
+        if m["smart_direction"] == "YES":
+            dir_color = "#00f5a0"
+            dir_arrow = "▲"
+            dir_label = "SMART MONEY: YES"
+        elif m["smart_direction"] == "NO":
+            dir_color = "#f54242"
+            dir_arrow = "▼"
+            dir_label = "SMART MONEY: NO"
+        else:
+            dir_color = "#5a7a9a"
+            dir_arrow = "◆"
+            dir_label = "SMART MONEY: SPLIT"
+
+        # Price gap indicator
+        if abs(gap) >= 0.10:
+            gap_color = "#f5c842"
+            gap_label = "LARGE GAP"
+        elif abs(gap) >= 0.05:
+            gap_color = "#a855f7"
+            gap_label = "MODERATE GAP"
+        else:
+            gap_color = "#3a4a5a"
+            gap_label = "SMALL GAP"
+
+        gap_direction = "underpriced" if gap > 0 else "overpriced"
+
+        # Divergence badge
+        if div >= 0.30:
+            div_badge = f'<span style="background:#f5424220;color:#f54242;padding:2px 6px;border-radius:3px;font-size:10px;font-weight:700">⚡ HIGH DIVERGENCE</span>'
+        elif div >= 0.15:
+            div_badge = f'<span style="background:#f5c84220;color:#f5c842;padding:2px 6px;border-radius:3px;font-size:10px;font-weight:700">DIVERGENT</span>'
+        else:
+            div_badge = ""
+
+        # Smart money bar (visual gauge)
+        yes_width = max(2, int(sy_pct * 100))
+        no_width = 100 - yes_width
+
+        # Dull money bar
+        dy_pct = m["dull_money_yes_pct"]
+        dull_yes_w = max(2, int(dy_pct * 100))
+        dull_no_w = 100 - dull_yes_w
+
+        # Wallet names
+        sharp_yes_names = ", ".join(w["display_name"] for w in m.get("sharp_wallets_yes", [])[:3])
+        sharp_no_names = ", ".join(w["display_name"] for w in m.get("sharp_wallets_no", [])[:3])
+
+        elite_indicator = ""
+        if m["elite_yes"] > 0 or m["elite_no"] > 0:
+            elite_parts = []
+            if m["elite_yes"] > 0:
+                elite_parts.append(f'{m["elite_yes"]}⚡ YES')
+            if m["elite_no"] > 0:
+                elite_parts.append(f'{m["elite_no"]}⚡ NO')
+            elite_indicator = f'<span style="color:#00f5a0;font-size:10px;font-weight:700">{" · ".join(elite_parts)}</span>'
+
+        cat_badge = {"sports": "🏀", "politics": "🏛️", "other": "📊"}.get(m["category"], "📊")
+
+        market_cards += f"""
+        <div class="card" style="margin-bottom:12px;padding:16px">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px;gap:8px">
+            <div style="flex:1">
+              <div style="font-size:14px;font-weight:600;color:#e8edf2;line-height:1.3">{cat_badge} {m['question'][:80]}</div>
+              <div style="font-size:11px;color:#3a4a5a;margin-top:4px">
+                Vol: ${m['volume']:,.0f} · Market: {mkt_price:.0%} · {m['sharp_yes_count']+m['sharp_no_count']} sharp wallets
+                {' · ' + elite_indicator if elite_indicator else ''}
+              </div>
+            </div>
+            <div style="text-align:right;min-width:90px">
+              <div style="font-size:20px;font-weight:800;color:{dir_color}">{dir_arrow} {sy_pct:.0%}</div>
+              <div style="font-size:9px;color:{dir_color};letter-spacing:0.5px">{dir_label}</div>
+            </div>
+          </div>
+
+          <!-- Smart Money Bar -->
+          <div style="margin-bottom:8px">
+            <div style="display:flex;justify-content:space-between;font-size:10px;color:#5a7a9a;margin-bottom:3px">
+              <span>SHARP MONEY</span>
+              <span>YES ${m['sharp_yes_notional']:,.0f} ({m['sharp_yes_count']}) vs NO ${m['sharp_no_notional']:,.0f} ({m['sharp_no_count']})</span>
+            </div>
+            <div style="display:flex;height:8px;border-radius:4px;overflow:hidden;background:#111b26">
+              <div style="width:{yes_width}%;background:#00f5a0;transition:width 0.3s"></div>
+              <div style="width:{no_width}%;background:#f54242;transition:width 0.3s"></div>
+            </div>
+            <div style="font-size:10px;color:#3a4a5a;margin-top:2px">{sharp_yes_names}{' · ' + sharp_no_names if sharp_no_names else ''}</div>
+          </div>
+
+          <!-- Dull Money Bar -->
+          <div style="margin-bottom:10px">
+            <div style="display:flex;justify-content:space-between;font-size:10px;color:#5a7a9a;margin-bottom:3px">
+              <span>DULL MONEY</span>
+              <span>YES ${m['dull_yes_notional']:,.0f} ({m['dull_yes_count']}) vs NO ${m['dull_no_notional']:,.0f} ({m['dull_no_count']})</span>
+            </div>
+            <div style="display:flex;height:6px;border-radius:3px;overflow:hidden;background:#111b26">
+              <div style="width:{dull_yes_w}%;background:#00f5a050"></div>
+              <div style="width:{dull_no_w}%;background:#f5424250"></div>
+            </div>
+          </div>
+
+          <!-- Signals Row -->
+          <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+            <div style="font-size:11px">
+              <span style="color:#5a7a9a">Price Gap:</span>
+              <span style="color:{gap_color};font-weight:700;font-family:monospace">{gap:+.0%}</span>
+              <span style="color:#3a4a5a;font-size:10px">({gap_label})</span>
+            </div>
+            <div style="font-size:11px">
+              <span style="color:#5a7a9a">Divergence:</span>
+              <span style="font-family:monospace;color:{'#f54242' if div>=0.3 else '#f5c842' if div>=0.15 else '#3a4a5a'}">{div:.0%}</span>
+            </div>
+            <div style="font-size:11px">
+              <span style="color:#5a7a9a">Interest:</span>
+              <span style="font-family:monospace;color:#00d4ff">{m['interest_score']:.2f}</span>
+            </div>
+            {div_badge}
+          </div>
+        </div>"""
+
+    return f"""<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Market Intelligence — SharpFlow</title>
+<style>
+  * {{ box-sizing:border-box; margin:0; padding:0; }}
+  body {{ background:#060d14; color:#c5d0de; font-family:-apple-system,system-ui,sans-serif; }}
+  .card {{ background:#0a1018; border:1px solid #1a2a3a; border-radius:8px; }}
+  a {{ color:#00d4ff; text-decoration:none; }}
+</style>
+</head><body>
+<div style="max-width:900px;margin:0 auto;padding:20px">
+
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:10px">
+    <div>
+      <a href="/" style="font-size:12px;color:#3a4a5a">← Dashboard</a>
+      <h1 style="font-size:22px;font-weight:800;color:#e8edf2;margin-top:8px">MARKET INTELLIGENCE</h1>
+      <div style="font-size:12px;color:#4a6070">Smart money positioning across {len(intel)} open markets</div>
+    </div>
+    <div style="text-align:right;font-size:11px;color:#3a4a5a">
+      Last refresh: {state.get('last_refresh', 'never')}<br>
+      <a href="/api/markets">/api/markets</a>
+    </div>
+  </div>
+
+  <div class="card" style="padding:14px;margin-bottom:20px">
+    <div style="font-size:12px;color:#5a7a9a;line-height:1.6">
+      <b style="color:#e8edf2">How to read this:</b>
+      The <span style="color:#00f5a0">green bar</span> shows how much sharp money is on YES vs <span style="color:#f54242">NO</span>.
+      The <b>Price Gap</b> is the difference between the market price and where smart money is positioned — a large gap means sharps see an opportunity the market hasn't priced in yet.
+      <b style="color:#f54242">High Divergence</b> means sharp and dull money disagree — historically, sharp money wins that fight.
+    </div>
+  </div>
+
+  {market_cards}
+
+  <div style="margin-top:30px;padding:16px;text-align:center;font-size:11px;color:#2a3a4a;border-top:1px solid #111b26">
+    SharpFlow v1.5 · Market Intelligence · Not financial advice
+  </div>
+</div>
+</body></html>"""
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
     """Serve a built-in dashboard — no separate frontend needed."""
@@ -1346,6 +1829,59 @@ def dashboard():
     else:
         signal_rows = '<tr><td colspan="8" style="padding:20px;text-align:center;color:#3a4a5a">No convergence signals detected yet</td></tr>'
 
+    # Build hot markets section (top 8 from market intelligence)
+    hot_markets_html = ""
+    intel = state.get("market_intelligence", [])
+    if intel:
+        for m in intel[:8]:
+            sy_pct = m["smart_money_yes_pct"]
+            gap = m["price_gap"]
+            div = m["divergence"]
+
+            if m["smart_direction"] == "YES":
+                dir_color = "#00f5a0"
+                dir_arrow = "▲"
+            elif m["smart_direction"] == "NO":
+                dir_color = "#f54242"
+                dir_arrow = "▼"
+            else:
+                dir_color = "#5a7a9a"
+                dir_arrow = "◆"
+
+            yes_w = max(2, int(sy_pct * 100))
+            no_w = 100 - yes_w
+
+            div_tag = ""
+            if div >= 0.30:
+                div_tag = '<span style="background:#f5424220;color:#f54242;padding:1px 4px;border-radius:2px;font-size:9px;font-weight:700;margin-left:4px">DIVERGENT</span>'
+
+            cat_badge = {"sports": "🏀", "politics": "🏛️", "other": "📊"}.get(m["category"], "📊")
+
+            hot_markets_html += f"""
+            <div style="background:#0a1018;border:1px solid #1a2a3a;border-radius:6px;padding:12px;display:flex;justify-content:space-between;align-items:center;gap:10px">
+              <div style="flex:1;min-width:0">
+                <div style="font-size:12px;font-weight:600;color:#e8edf2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{cat_badge} {m['question'][:55]}</div>
+                <div style="display:flex;height:4px;border-radius:2px;overflow:hidden;background:#111b26;margin-top:6px">
+                  <div style="width:{yes_w}%;background:#00f5a0"></div>
+                  <div style="width:{no_w}%;background:#f54242"></div>
+                </div>
+                <div style="font-size:10px;color:#3a4a5a;margin-top:3px">
+                  Mkt: {m['market_price']:.0%} · Gap: <span style="color:{'#f5c842' if abs(gap)>=0.10 else '#5a7a9a'}">{gap:+.0%}</span> · {m['sharp_yes_count']+m['sharp_no_count']} sharps{div_tag}
+                </div>
+              </div>
+              <div style="text-align:right;min-width:60px">
+                <div style="font-size:18px;font-weight:800;color:{dir_color}">{dir_arrow}{sy_pct:.0%}</div>
+                <div style="font-size:9px;color:#3a4a5a">smart $</div>
+              </div>
+            </div>"""
+        hot_markets_html = f"""
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:8px">
+          {hot_markets_html}
+        </div>
+        <div style="text-align:right;margin-top:8px"><a href="/markets" style="font-size:12px;color:#a855f7">View all {len(intel)} markets →</a></div>"""
+    else:
+        hot_markets_html = '<div style="padding:20px;text-align:center;color:#3a4a5a;background:#0a1018;border:1px solid #1a2a3a;border-radius:8px">Market intelligence data will appear after the next pipeline run</div>'
+
     # Status banner
     if status == "initializing" or status == "running":
         status_html = f'<div style="background:#f5c84215;border:1px solid #f5c84230;color:#f5c842;padding:14px 20px;border-radius:8px;margin-bottom:20px;font-size:14px">⏳ <b>Pipeline running...</b> {progress}</div>'
@@ -1387,8 +1923,9 @@ def dashboard():
       <div style="font-size:12px;color:#4a6070">Polymarket Sharp Wallet Intelligence</div>
     </div>
     <div style="font-size:11px;color:#3a4a5a">
-      API: <a href="/api/wallets">/api/wallets</a> ·
-      <a href="/api/convergence">/api/convergence</a> ·
+      <a href="/markets" style="font-size:13px;font-weight:700;color:#a855f7">📊 Market Intelligence</a> ·
+      <a href="/api/wallets">/api/wallets</a> ·
+      <a href="/api/markets">/api/markets</a> ·
       <a href="/api/stats">/api/stats</a>
     </div>
   </div>
@@ -1403,6 +1940,7 @@ def dashboard():
     <div class="card stat"><div class="val" style="color:#00f5a0">{tiers.get('elite',0)}</div><div class="lbl">ELITE</div></div>
     <div class="card stat"><div class="val" style="color:#f5c842">{tiers.get('sharp',0)}</div><div class="lbl">SHARP</div></div>
     <div class="card stat"><div class="val" style="color:#a855f7">{len(signals)}</div><div class="lbl">CONVERGENCE</div></div>
+    <div class="card stat"><div class="val" style="color:#f5c842">{len(intel)}</div><div class="lbl">MKTS TRACKED</div></div>
   </div>
 
   <!-- Convergence Signals -->
@@ -1417,6 +1955,12 @@ def dashboard():
       </tr>
       {signal_rows}
     </table>
+  </div>
+
+  <!-- Hot Markets -->
+  <h2 style="font-size:14px;font-weight:700;color:#a855f7;margin-bottom:10px;letter-spacing:1px">📊 HOT MARKETS — SMART MONEY VIEW</h2>
+  <div style="margin-bottom:24px">
+    {hot_markets_html}
   </div>
 
   <!-- Wallet Leaderboard -->
