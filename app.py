@@ -87,6 +87,572 @@ POLITICS_KW = ["politics","election","president","congress","senate","governor",
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# Database
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+# ================================================================
+# DATABASE
+# ================================================================
+
+import psycopg2
+from psycopg2.extras import execute_values, RealDictCursor
+
+def db_conn():
+    """Get a database connection."""
+    if not DATABASE_URL:
+        return None
+    return psycopg2.connect(DATABASE_URL)
+
+def db_init():
+    """Create tables if they don't exist."""
+    if not DATABASE_URL:
+        logger.warning("No DATABASE_URL set — running without persistence")
+        return
+
+    conn = db_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS trades (
+        id BIGSERIAL PRIMARY KEY,
+        wallet TEXT NOT NULL,
+        condition_id TEXT NOT NULL,
+        side TEXT NOT NULL,
+        outcome TEXT,
+        price DOUBLE PRECISION,
+        size DOUBLE PRECISION,
+        timestamp BIGINT,
+        title TEXT,
+        category TEXT,
+        winning_outcome TEXT,
+        ingested_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(wallet, condition_id, timestamp, side, price, size)
+    );
+    CREATE INDEX IF NOT EXISTS idx_trades_wallet ON trades(wallet);
+    CREATE INDEX IF NOT EXISTS idx_trades_condition ON trades(condition_id);
+    CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS wallet_scores (
+        id BIGSERIAL PRIMARY KEY,
+        wallet TEXT NOT NULL,
+        display_name TEXT,
+        sharpness_score DOUBLE PRECISION,
+        tier TEXT,
+        clv_score DOUBLE PRECISION,
+        timing_score DOUBLE PRECISION,
+        consistency_score DOUBLE PRECISION,
+        roi_score DOUBLE PRECISION,
+        avg_clv DOUBLE PRECISION,
+        win_rate DOUBLE PRECISION,
+        total_pnl DOUBLE PRECISION,
+        total_trades INT,
+        distinct_markets INT,
+        early_entry_pct DOUBLE PRECISION,
+        scored_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_ws_wallet ON wallet_scores(wallet);
+    CREATE INDEX IF NOT EXISTS idx_ws_scored_at ON wallet_scores(scored_at);
+    CREATE INDEX IF NOT EXISTS idx_ws_tier ON wallet_scores(tier);
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS market_intel (
+        id BIGSERIAL PRIMARY KEY,
+        condition_id TEXT NOT NULL,
+        question TEXT,
+        category TEXT,
+        market_price DOUBLE PRECISION,
+        smart_direction TEXT,
+        smart_money_yes_pct DOUBLE PRECISION,
+        price_gap DOUBLE PRECISION,
+        divergence DOUBLE PRECISION,
+        interest_score DOUBLE PRECISION,
+        sharp_yes_count INT,
+        sharp_no_count INT,
+        sharp_yes_notional DOUBLE PRECISION,
+        sharp_no_notional DOUBLE PRECISION,
+        dull_yes_count INT,
+        dull_no_count INT,
+        recorded_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_mi_condition ON market_intel(condition_id);
+    CREATE INDEX IF NOT EXISTS idx_mi_recorded ON market_intel(recorded_at);
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS pipeline_runs (
+        id BIGSERIAL PRIMARY KEY,
+        started_at TIMESTAMPTZ DEFAULT NOW(),
+        finished_at TIMESTAMPTZ,
+        markets_analyzed INT,
+        trades_ingested INT,
+        wallets_scored INT,
+        convergence_signals INT,
+        markets_with_intel INT,
+        status TEXT,
+        notes TEXT
+    );
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS markets (
+        id BIGSERIAL PRIMARY KEY,
+        condition_id TEXT NOT NULL UNIQUE,
+        question TEXT,
+        category TEXT,
+        slug TEXT,
+        volume DOUBLE PRECISION,
+        outcome_yes TEXT,
+        outcome_no TEXT,
+        resolved BOOLEAN DEFAULT FALSE,
+        winning_outcome TEXT,
+        resolved_at TIMESTAMPTZ,
+        end_date TIMESTAMPTZ,
+        first_seen_at TIMESTAMPTZ DEFAULT NOW(),
+        last_updated_at TIMESTAMPTZ DEFAULT NOW(),
+        final_price_yes DOUBLE PRECISION,
+        final_price_no DOUBLE PRECISION,
+        total_traders INT,
+        open_interest DOUBLE PRECISION
+    );
+    CREATE INDEX IF NOT EXISTS idx_markets_cid ON markets(condition_id);
+    CREATE INDEX IF NOT EXISTS idx_markets_resolved ON markets(resolved);
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS convergence_snapshots (
+        id BIGSERIAL PRIMARY KEY,
+        condition_id TEXT NOT NULL,
+        market_title TEXT,
+        side TEXT,
+        signal_type TEXT,
+        strength DOUBLE PRECISION,
+        wallet_count INT,
+        elite_count INT,
+        sharp_count INT,
+        total_notional DOUBLE PRECISION,
+        market_price_at_signal DOUBLE PRECISION,
+        wallets_json TEXT,
+        detected_at TIMESTAMPTZ DEFAULT NOW(),
+        -- outcome tracking (filled in later when market resolves)
+        market_resolved BOOLEAN DEFAULT FALSE,
+        winning_side TEXT,
+        resolved_at TIMESTAMPTZ,
+        signal_correct BOOLEAN,
+        price_at_resolution DOUBLE PRECISION
+    );
+    CREATE INDEX IF NOT EXISTS idx_cs_condition ON convergence_snapshots(condition_id);
+    CREATE INDEX IF NOT EXISTS idx_cs_detected ON convergence_snapshots(detected_at);
+    CREATE INDEX IF NOT EXISTS idx_cs_resolved ON convergence_snapshots(market_resolved);
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS wallet_positions (
+        id BIGSERIAL PRIMARY KEY,
+        wallet TEXT NOT NULL,
+        condition_id TEXT NOT NULL,
+        outcome TEXT,
+        size DOUBLE PRECISION,
+        avg_price DOUBLE PRECISION,
+        notional DOUBLE PRECISION,
+        cur_price DOUBLE PRECISION,
+        unrealized_pnl DOUBLE PRECISION,
+        title TEXT,
+        snapshot_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_wp_wallet ON wallet_positions(wallet);
+    CREATE INDEX IF NOT EXISTS idx_wp_condition ON wallet_positions(condition_id);
+    CREATE INDEX IF NOT EXISTS idx_wp_snapshot ON wallet_positions(snapshot_at);
+    """)
+
+    conn.commit()
+    cur.close()
+    conn.close()
+    logger.info("Database initialized successfully")
+
+
+def db_save_trades(trades_list):
+    """Bulk insert trades, skipping duplicates."""
+    if not DATABASE_URL or not trades_list:
+        return 0
+    conn = db_conn()
+    cur = conn.cursor()
+
+    rows = []
+    for t in trades_list:
+        rows.append((
+            t.get("wallet", ""),
+            t.get("condition_id", ""),
+            t.get("side", "BUY"),
+            t.get("outcome", ""),
+            t.get("price", 0),
+            t.get("size", 0),
+            t.get("timestamp", 0),
+            t.get("title", ""),
+            t.get("category", "other"),
+            t.get("winning_outcome", ""),
+        ))
+
+    if not rows:
+        conn.close()
+        return 0
+
+    inserted = 0
+    try:
+        execute_values(cur, """
+            INSERT INTO trades (wallet, condition_id, side, outcome, price, size, timestamp, title, category, winning_outcome)
+            VALUES %s
+            ON CONFLICT (wallet, condition_id, timestamp, side, price, size) DO NOTHING
+        """, rows, page_size=1000)
+        inserted = cur.rowcount
+        conn.commit()
+    except Exception as e:
+        logger.error(f"DB trade insert error: {e}")
+        conn.rollback()
+
+    cur.close()
+    conn.close()
+    return inserted
+
+
+def db_save_wallet_scores(scored_wallets):
+    """Save current wallet scores snapshot."""
+    if not DATABASE_URL or not scored_wallets:
+        return
+    conn = db_conn()
+    cur = conn.cursor()
+
+    rows = []
+    for w in scored_wallets:
+        rows.append((
+            w["wallet"], w["display_name"], w["sharpness_score"], w["tier"],
+            w.get("clv_score", 0), w.get("timing_score", 0),
+            w.get("consistency_score", 0), w.get("roi_score", 0),
+            w.get("avg_clv", 0), w.get("win_rate", 0),
+            w.get("total_pnl", 0), w.get("total_trades", 0),
+            w.get("distinct_markets", 0), w.get("early_entry_pct", 0),
+        ))
+
+    try:
+        execute_values(cur, """
+            INSERT INTO wallet_scores (wallet, display_name, sharpness_score, tier,
+                clv_score, timing_score, consistency_score, roi_score,
+                avg_clv, win_rate, total_pnl, total_trades, distinct_markets, early_entry_pct)
+            VALUES %s
+        """, rows, page_size=500)
+        conn.commit()
+    except Exception as e:
+        logger.error(f"DB wallet score insert error: {e}")
+        conn.rollback()
+
+    cur.close()
+    conn.close()
+
+
+def db_save_market_intel(intel_list):
+    """Save market intelligence snapshot."""
+    if not DATABASE_URL or not intel_list:
+        return
+    conn = db_conn()
+    cur = conn.cursor()
+
+    rows = []
+    for m in intel_list:
+        rows.append((
+            m["condition_id"], m.get("question", ""), m.get("category", ""),
+            m.get("market_price", 0), m.get("smart_direction", ""),
+            m.get("smart_money_yes_pct", 0), m.get("price_gap", 0),
+            m.get("divergence", 0), m.get("interest_score", 0),
+            m.get("sharp_yes_count", 0), m.get("sharp_no_count", 0),
+            m.get("sharp_yes_notional", 0), m.get("sharp_no_notional", 0),
+            m.get("dull_yes_count", 0), m.get("dull_no_count", 0),
+        ))
+
+    try:
+        execute_values(cur, """
+            INSERT INTO market_intel (condition_id, question, category, market_price,
+                smart_direction, smart_money_yes_pct, price_gap, divergence, interest_score,
+                sharp_yes_count, sharp_no_count, sharp_yes_notional, sharp_no_notional,
+                dull_yes_count, dull_no_count)
+            VALUES %s
+        """, rows, page_size=500)
+        conn.commit()
+    except Exception as e:
+        logger.error(f"DB market intel insert error: {e}")
+        conn.rollback()
+
+    cur.close()
+    conn.close()
+
+
+def db_save_pipeline_run(stats_dict):
+    """Record a pipeline run."""
+    if not DATABASE_URL:
+        return
+    conn = db_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO pipeline_runs (finished_at, markets_analyzed, trades_ingested,
+                wallets_scored, convergence_signals, markets_with_intel, status, notes)
+            VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            stats_dict.get("markets", 0), stats_dict.get("trades", 0),
+            stats_dict.get("wallets", 0), stats_dict.get("convergence", 0),
+            stats_dict.get("intel", 0), stats_dict.get("status", "ok"),
+            stats_dict.get("notes", ""),
+        ))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"DB pipeline run insert error: {e}")
+        conn.rollback()
+    cur.close()
+    conn.close()
+
+
+def db_get_trade_count():
+    """Get total trades in the database."""
+    if not DATABASE_URL:
+        return 0
+    try:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM trades")
+        count = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+        return count
+    except:
+        return 0
+
+
+def db_get_all_trades():
+    """Load all trades from the database for scoring."""
+    if not DATABASE_URL:
+        return []
+    try:
+        conn = db_conn()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("""
+            SELECT wallet, condition_id, side, outcome, price, size,
+                   timestamp, title, category, winning_outcome
+            FROM trades ORDER BY timestamp DESC
+        """)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error(f"DB load trades error: {e}")
+        return []
+
+
+def db_save_markets(markets_list):
+    """Save/update market metadata. Upsert on condition_id."""
+    if not DATABASE_URL or not markets_list:
+        return
+    conn = db_conn()
+    cur = conn.cursor()
+
+    rows = []
+    for m in markets_list:
+        cid = m.get("condition_id") or m.get("conditionId", "")
+        if not cid:
+            continue
+        question = m.get("question", "") or m.get("title", "")
+        resolved = m.get("resolved", False) or m.get("closed", False)
+        winning = m.get("winning_outcome", "") or ""
+        volume = float(m.get("volume", 0) or m.get("volumeNum", 0) or 0)
+        slug = m.get("slug", "") or m.get("market_slug", "")
+        end_date = m.get("endDate") or m.get("end_date_iso") or None
+
+        rows.append((
+            cid, question, categorize(question, "") if question else "other",
+            slug, volume, resolved, winning, end_date,
+        ))
+
+    if not rows:
+        conn.close()
+        return
+
+    try:
+        for row in rows:
+            cur.execute("""
+                INSERT INTO markets (condition_id, question, category, slug, volume, resolved, winning_outcome, end_date, last_updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (condition_id) DO UPDATE SET
+                    volume = GREATEST(markets.volume, EXCLUDED.volume),
+                    resolved = EXCLUDED.resolved,
+                    winning_outcome = CASE WHEN EXCLUDED.winning_outcome != '' THEN EXCLUDED.winning_outcome ELSE markets.winning_outcome END,
+                    last_updated_at = NOW()
+            """, row)
+        conn.commit()
+    except Exception as e:
+        logger.error(f"DB markets save error: {e}")
+        conn.rollback()
+
+    cur.close()
+    conn.close()
+
+
+def db_save_convergence_signals(signals_list):
+    """Save convergence signal snapshots for backtesting."""
+    if not DATABASE_URL or not signals_list:
+        return
+    conn = db_conn()
+    cur = conn.cursor()
+
+    for s in signals_list:
+        # Check if we already logged this exact signal (same market + side + similar time)
+        cid = s.get("condition_id", "")
+        side = s.get("side", "")
+
+        try:
+            cur.execute("""
+                SELECT id FROM convergence_snapshots
+                WHERE condition_id = %s AND side = %s
+                AND detected_at > NOW() - INTERVAL '2 hours'
+            """, (cid, side))
+
+            if cur.fetchone():
+                continue  # Already recorded this signal recently
+
+            wallets_json = json.dumps(s.get("wallets", []))
+
+            cur.execute("""
+                INSERT INTO convergence_snapshots
+                    (condition_id, market_title, side, signal_type, strength,
+                     wallet_count, elite_count, sharp_count, total_notional,
+                     market_price_at_signal, wallets_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                cid, s.get("market_title", ""), side,
+                s.get("signal_type", ""), s.get("strength", 0),
+                s.get("wallet_count", 0), s.get("elite_count", 0),
+                s.get("sharp_count", 0), s.get("total_notional", 0),
+                s.get("market_price", 0), wallets_json,
+            ))
+        except Exception as e:
+            logger.error(f"DB convergence save error: {e}")
+            conn.rollback()
+            continue
+
+    try:
+        conn.commit()
+    except:
+        pass
+    cur.close()
+    conn.close()
+
+
+def db_save_wallet_positions(scored_wallets):
+    """Snapshot open positions for sharp+ wallets."""
+    if not DATABASE_URL:
+        return
+    sharp_wallets = [w for w in scored_wallets if w["tier"] in ("elite", "sharp")]
+    if not sharp_wallets:
+        return
+
+    conn = db_conn()
+    cur = conn.cursor()
+    total_saved = 0
+
+    for wdata in sharp_wallets:
+        wallet_addr = wdata["wallet"]
+        try:
+            positions = api_get(f"{DATA_API}/positions", {"user": wallet_addr, "sizeThreshold": 1})
+            if not positions or not isinstance(positions, list):
+                continue
+
+            for pos in positions:
+                size = float(pos.get("size", 0) or 0)
+                avg_price = float(pos.get("avgPrice", 0) or 0)
+                if size < 1:
+                    continue
+                notional = size * avg_price
+                cur_price = float(pos.get("curPrice", 0) or 0)
+                pnl = (cur_price - avg_price) * size if cur_price > 0 else 0
+                cid = pos.get("conditionId") or pos.get("market") or ""
+                outcome = pos.get("outcome", "")
+                title = pos.get("title", "") or pos.get("eventTitle", "")
+
+                cur.execute("""
+                    INSERT INTO wallet_positions
+                        (wallet, condition_id, outcome, size, avg_price, notional, cur_price, unrealized_pnl, title)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (wallet_addr, cid, outcome, size, avg_price, notional, cur_price, pnl, title))
+                total_saved += 1
+
+        except Exception as e:
+            logger.debug(f"Position snapshot error for {wallet_addr[:10]}: {e}")
+
+    try:
+        conn.commit()
+    except Exception as e:
+        logger.error(f"DB position snapshot commit error: {e}")
+        conn.rollback()
+
+    cur.close()
+    conn.close()
+    logger.info(f"  Position snapshots saved: {total_saved} across {len(sharp_wallets)} sharp wallets")
+
+
+def db_update_convergence_outcomes():
+    """Check if any unresolved convergence signals have resolved and grade them."""
+    if not DATABASE_URL:
+        return
+    conn = db_conn()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    try:
+        # Find unresolved convergence signals
+        cur.execute("""
+            SELECT cs.id, cs.condition_id, cs.side
+            FROM convergence_snapshots cs
+            WHERE cs.market_resolved = FALSE
+        """)
+        unresolved = cur.fetchall()
+
+        if not unresolved:
+            cur.close()
+            conn.close()
+            return
+
+        # Check each against the markets table
+        for row in unresolved:
+            cur.execute("""
+                SELECT resolved, winning_outcome FROM markets
+                WHERE condition_id = %s AND resolved = TRUE
+            """, (row["condition_id"],))
+            mkt = cur.fetchone()
+
+            if mkt and mkt["resolved"]:
+                winning = mkt["winning_outcome"] or ""
+                signal_correct = None
+                if winning and row["side"]:
+                    signal_correct = (row["side"].upper() == winning.upper())
+
+                cur.execute("""
+                    UPDATE convergence_snapshots
+                    SET market_resolved = TRUE, winning_side = %s,
+                        resolved_at = NOW(), signal_correct = %s
+                    WHERE id = %s
+                """, (winning, signal_correct, row["id"]))
+
+        conn.commit()
+        resolved_count = sum(1 for r in unresolved if True)  # just for logging
+        logger.info(f"  Checked {len(unresolved)} unresolved convergence signals")
+
+    except Exception as e:
+        logger.error(f"DB convergence outcome update error: {e}")
+        conn.rollback()
+
+    cur.close()
+    conn.close()
+
+
 # ================================================================
 # STATE
 # ================================================================
@@ -1407,6 +1973,44 @@ def run_pipeline():
         logger.info(f"Pipeline complete in {elapsed/60:.1f} minutes")
         logger.info(f"  Markets: {len(markets)} | Trades: {len(trades)} | Wallets scored: {len(scored)} | Convergence: {len(signals)} | Market intel: {len(intel)}")
 
+        # ---- PERSIST TO DATABASE ----
+        if DATABASE_URL:
+            state["progress"] = "Saving to database..."
+            logger.info("Persisting data to database...")
+            try:
+                inserted = db_save_trades(trades)
+                logger.info(f"  Trades saved: {inserted} new (of {len(trades)} total)")
+
+                db_save_wallet_scores(scored)
+                logger.info(f"  Wallet scores snapshot saved: {len(scored)}")
+
+                db_save_market_intel(intel)
+                logger.info(f"  Market intel snapshot saved: {len(intel)}")
+
+                db_save_markets(markets)
+                logger.info(f"  Market metadata saved: {len(markets)}")
+
+                db_save_convergence_signals(signals)
+                logger.info(f"  Convergence signals saved: {len(signals)}")
+
+                state["progress"] = "Snapshotting wallet positions..."
+                db_save_wallet_positions(scored)
+
+                db_update_convergence_outcomes()
+
+                db_save_pipeline_run({
+                    "markets": len(markets), "trades": len(trades),
+                    "wallets": len(scored), "convergence": len(signals),
+                    "intel": len(intel), "status": "ok",
+                    "notes": f"Elapsed: {elapsed/60:.1f} min",
+                })
+                total_db_trades = db_get_trade_count()
+                logger.info(f"  Total trades in database: {total_db_trades:,}")
+            except Exception as e:
+                logger.error(f"Database persistence error: {e}")
+
+        state["progress"] = f"Complete! {len(scored)} wallets scored, {len(intel)} markets analyzed in {elapsed/60:.1f} min"
+
         # ---- TELEGRAM ALERTS ----
         logger.info("Running alert checks...")
 
@@ -1605,7 +2209,80 @@ def get_stats():
         "markets_with_intel": len(state.get("market_intelligence", [])),
         "last_refresh": state["last_refresh"],
         "error": state["error"],
+        "db_connected": bool(DATABASE_URL),
+        "db_total_trades": db_get_trade_count() if DATABASE_URL else None,
     }
+
+
+@app.get("/api/db")
+def get_db_stats():
+    """Database statistics."""
+    if not DATABASE_URL:
+        return {"connected": False, "message": "No DATABASE_URL configured"}
+    try:
+        conn = db_conn()
+        cur = conn.cursor()
+
+        cur.execute("SELECT COUNT(*) FROM trades")
+        trade_count = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(DISTINCT wallet) FROM trades")
+        wallet_count = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(DISTINCT condition_id) FROM trades")
+        market_count = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM wallet_scores")
+        score_snapshots = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM pipeline_runs")
+        run_count = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM markets")
+        markets_stored = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM markets WHERE resolved = TRUE")
+        markets_resolved = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM convergence_snapshots")
+        convergence_count = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM convergence_snapshots WHERE signal_correct = TRUE")
+        convergence_correct = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM convergence_snapshots WHERE market_resolved = TRUE")
+        convergence_resolved = cur.fetchone()[0]
+
+        cur.execute("SELECT COUNT(*) FROM wallet_positions")
+        position_snapshots = cur.fetchone()[0]
+
+        cur.execute("SELECT MIN(timestamp), MAX(timestamp) FROM trades WHERE timestamp > 0")
+        ts_row = cur.fetchone()
+        min_ts = ts_row[0] if ts_row[0] else 0
+        max_ts = ts_row[1] if ts_row[1] else 0
+
+        cur.close()
+        conn.close()
+
+        return {
+            "connected": True,
+            "total_trades": trade_count,
+            "unique_wallets": wallet_count,
+            "unique_markets": market_count,
+            "score_snapshots": score_snapshots,
+            "pipeline_runs": run_count,
+            "markets_stored": markets_stored,
+            "markets_resolved": markets_resolved,
+            "convergence_signals_stored": convergence_count,
+            "convergence_resolved": convergence_resolved,
+            "convergence_correct": convergence_correct,
+            "convergence_accuracy": f"{convergence_correct/convergence_resolved*100:.0f}%" if convergence_resolved > 0 else "N/A",
+            "position_snapshots": position_snapshots,
+            "earliest_trade": datetime.utcfromtimestamp(min_ts).isoformat() if min_ts > 0 else None,
+            "latest_trade": datetime.utcfromtimestamp(max_ts).isoformat() if max_ts > 0 else None,
+        }
+    except Exception as e:
+        return {"connected": False, "error": str(e)}
 
 
 
@@ -1643,6 +2320,12 @@ def dashboard():
 
 def background_pipeline():
     """Run pipeline on startup and then on schedule."""
+    # Initialize database
+    try:
+        db_init()
+    except Exception as e:
+        logger.error(f"Database init failed: {e}")
+
     # Initial run
     run_pipeline()
 
