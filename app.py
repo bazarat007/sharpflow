@@ -2060,6 +2060,19 @@ def test_telegram():
     return {"status": "error", "message": "Failed to send. Check your bot token and chat ID."}
 
 
+@app.get("/api/debug-env")
+def debug_env():
+    """Check which env vars are set (values hidden)."""
+    db_url = os.getenv("DATABASE_URL", "")
+    return {
+        "DATABASE_URL_set": bool(db_url),
+        "DATABASE_URL_length": len(db_url),
+        "DATABASE_URL_starts_with": db_url[:15] + "..." if db_url else "(empty)",
+        "DATABASE_URL_from_global": bool(DATABASE_URL),
+        "all_db_vars": [k for k in os.environ if "DATABASE" in k.upper() or "POSTGRES" in k.upper() or "PG" in k.upper()],
+    }
+
+
 @app.get("/api/wallets")
 def get_wallets(
     sort: str = Query("sharpness"),
