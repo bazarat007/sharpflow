@@ -149,7 +149,7 @@ function App(){
   const[tab,setTab]=useState("dashboard");
   const[wF,setWF]=useState("all");
   const[wS,setWS]=useState("sharpness");
-  const stats=useApi("/api/stats",30000);
+  const stats=useApi("/api/stats",5000);
   const wD=useApi("/api/wallets?limit=200",60000);
   const cD=useApi("/api/convergence",60000);
   const mD=useApi("/api/markets?limit=50",60000);
@@ -173,7 +173,7 @@ function App(){
       </div>
       <div style={{display:"flex",alignItems:"center",gap:8}}>
         {stats?.status==="ready"?<span style={{fontSize:10,color:"#00f5a0"}}>{"\u25cf"} Live</span>:
-         stats?.status==="running"?<span style={{fontSize:10,color:"#f5c842",animation:"pulse 1.5s infinite"}}>{"\u25cf"} Refreshing...</span>:
+         stats?.status==="running"?<span style={{fontSize:10,color:"#f5c842",animation:"pulse 1.5s infinite"}}>{"\u25cf"} {stats?.progress||"Refreshing..."}</span>:
          <span style={{fontSize:10,color:"#f54242"}}>{"\u25cf"} {stats?.status||"Loading"}</span>}
         <span style={{fontSize:10,color:"#2a3a4a"}}>{stats?.last_refresh?new Date(stats.last_refresh+"Z").toLocaleTimeString():""}</span>
       </div>
