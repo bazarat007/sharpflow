@@ -428,21 +428,26 @@ def db_get_trade_count():
         return 0
 
 
-def db_get_all_trades():
-    """Load all trades from the database for scoring."""
+def db_get_all_trades(months_back=6):
+    """Load trades from the database for scoring. Only loads last N months for efficiency."""
     if not DATABASE_URL:
         return []
     try:
         conn = db_conn()
         cur = conn.cursor(cursor_factory=RealDictCursor)
+        # Calculate cutoff timestamp (N months ago)
+        cutoff = int((datetime.utcnow() - timedelta(days=months_back * 30)).timestamp())
         cur.execute("""
             SELECT wallet, condition_id, side, outcome, price, size,
                    timestamp, title, category, winning_outcome
-            FROM trades ORDER BY timestamp DESC
-        """)
+            FROM trades
+            WHERE timestamp > %s
+            ORDER BY timestamp DESC
+        """, (cutoff,))
         rows = cur.fetchall()
         cur.close()
         conn.close()
+        logger.info(f"  DB query returned {len(rows):,} trades (last {months_back} months)")
         return [dict(r) for r in rows]
     except Exception as e:
         logger.error(f"DB load trades error: {e}")
@@ -1954,6 +1959,45 @@ def run_pipeline():
         # Step 2.5: Seed from Polymarket leaderboard
         trades = seed_from_leaderboard(trades, markets_lookup)
         state["trades_analyzed"] = len(trades)
+
+        # Step 2.6: Merge with historical trades from database
+        if DATABASE_URL:
+            state["progress"] = "Loading historical trades from database..."
+            logger.info("Loading historical trades from database...")
+            try:
+                db_trades = db_get_all_trades()
+                if db_trades:
+                    # Build a set of existing trade signatures to avoid duplicates
+                    existing_sigs = set()
+                    for t in trades:
+                        sig = (t["wallet"], t["condition_id"], t.get("timestamp", 0), t["side"], t["price"])
+                        existing_sigs.add(sig)
+
+                    # Add DB trades that aren't already in memory
+                    added = 0
+                    for t in db_trades:
+                        sig = (t["wallet"], t["condition_id"], t.get("timestamp", 0), t["side"], t["price"])
+                        if sig not in existing_sigs:
+                            trades.append(t)
+                            existing_sigs.add(sig)
+                            added += 1
+
+                    # Also expand the markets lookup with any markets from DB trades
+                    for t in db_trades:
+                        cid = t.get("condition_id", "")
+                        if cid and cid not in markets_lookup:
+                            markets_lookup[cid] = {
+                                "condition_id": cid,
+                                "question": t.get("title", ""),
+                                "category": t.get("category", "other"),
+                                "winning_outcome": t.get("winning_outcome", ""),
+                            }
+
+                    logger.info(f"  Loaded {len(db_trades):,} DB trades, added {added:,} new. Total trades for scoring: {len(trades):,}")
+                    state["trades_analyzed"] = len(trades)
+                    state["progress"] = f"Scoring with {len(trades):,} trades ({added:,} from history)..."
+            except Exception as e:
+                logger.error(f"Error loading DB trades: {e}")
 
         # Step 3: Score wallets
         scored = score_all_wallets(trades, markets_lookup)
