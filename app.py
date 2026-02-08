@@ -773,6 +773,8 @@ def fetch_resolved_markets(limit=MARKETS_TO_FETCH):
                 "category": cat,
                 "winning_outcome": winning,
                 "tokens": tokens,
+                "resolved": True,
+                "closed": True,
             })
 
         logger.info(f"  Fetched batch at offset {offset}, total: {len(all_markets)}")
@@ -2297,6 +2299,280 @@ def get_db_stats():
     except Exception as e:
         return {"connected": False, "error": str(e)}
 
+
+
+# ================================================================
+# HISTORICAL BACKFILL
+# ================================================================
+
+backfill_state = {
+    "running": False,
+    "progress": "",
+    "markets_found": 0,
+    "markets_processed": 0,
+    "markets_skipped": 0,
+    "trades_ingested": 0,
+    "errors": 0,
+    "started_at": None,
+    "finished_at": None,
+    "last_error": None,
+}
+
+
+def get_db_market_condition_ids():
+    """Get all condition_ids we already have trades for in the database."""
+    if not DATABASE_URL:
+        return set()
+    try:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT condition_id FROM trades")
+        result = {row[0] for row in cur.fetchall()}
+        cur.close()
+        conn.close()
+        return result
+    except Exception as e:
+        logger.error(f"Error getting existing condition IDs: {e}")
+        return set()
+
+
+def run_backfill(max_markets=10000, min_volume=500):
+    """
+    Backfill historical data from Polymarket.
+    Pages through ALL resolved markets and fetches trades for any we don't have yet.
+    Saves to Postgres in batches — fully resumable.
+    """
+    if backfill_state["running"]:
+        logger.warning("Backfill already running, skipping")
+        return
+
+    backfill_state["running"] = True
+    backfill_state["started_at"] = datetime.utcnow().isoformat()
+    backfill_state["finished_at"] = None
+    backfill_state["errors"] = 0
+    backfill_state["trades_ingested"] = 0
+    backfill_state["markets_processed"] = 0
+    backfill_state["markets_skipped"] = 0
+    backfill_state["last_error"] = None
+
+    logger.info(f"Starting historical backfill (max {max_markets} markets, min vol ${min_volume})")
+
+    try:
+        # Step 1: Get condition IDs we already have
+        existing_cids = get_db_market_condition_ids()
+        logger.info(f"Already have trades for {len(existing_cids)} markets in DB")
+        backfill_state["progress"] = f"Found {len(existing_cids)} existing markets. Fetching market list..."
+
+        # Step 2: Page through ALL resolved markets from Gamma API
+        all_markets = []
+        offset = 0
+        while len(all_markets) < max_markets:
+            try:
+                data = api_get(f"{GAMMA_API}/markets", {
+                    "closed": "true", "limit": 100, "offset": offset,
+                    "order": "volume", "ascending": "false",
+                })
+                if not data or not isinstance(data, list) or len(data) == 0:
+                    break
+
+                for m in data:
+                    cid = m.get("conditionId") or m.get("condition_id")
+                    vol = float(m.get("volume", 0) or 0)
+                    if not cid or vol < min_volume:
+                        continue
+
+                    tags = [t.get("label", "") if isinstance(t, dict) else str(t)
+                            for t in (m.get("tags") or [])]
+
+                    # Determine winner
+                    winning = None
+                    tokens = m.get("tokens", [])
+                    if isinstance(tokens, list):
+                        for tok in tokens:
+                            if isinstance(tok, dict) and tok.get("winner"):
+                                winning = tok.get("outcome", "").lower()
+
+                    if not winning:
+                        try:
+                            op = m.get("outcomePrices", "")
+                            outcomes = m.get("outcomes", "")
+                            if op and outcomes:
+                                if isinstance(op, str):
+                                    op = json.loads(op)
+                                if isinstance(outcomes, str):
+                                    outcomes = json.loads(outcomes)
+                                if isinstance(op, list) and isinstance(outcomes, list) and len(op) == len(outcomes):
+                                    for price, outcome_name in zip(op, outcomes):
+                                        if float(price) >= 0.95:
+                                            winning = outcome_name.lower()
+                                            break
+                        except Exception:
+                            pass
+
+                    if not winning and m.get("resolved"):
+                        res = m.get("resolution", "")
+                        if res:
+                            winning = str(res).lower()
+
+                    cat = categorize(m.get("question", ""), " ".join(tags))
+
+                    all_markets.append({
+                        "condition_id": cid,
+                        "question": m.get("question", ""),
+                        "slug": m.get("slug", ""),
+                        "volume": vol,
+                        "category": cat,
+                        "winning_outcome": winning,
+                        "tokens": tokens,
+                        "resolved": bool(m.get("resolved") or m.get("closed")),
+                    })
+
+                offset += 100
+                backfill_state["progress"] = f"Scanning markets: {len(all_markets)} found (offset {offset})..."
+                logger.info(f"  Backfill: fetched {len(all_markets)} markets at offset {offset}")
+
+                if len(data) < 100:
+                    break
+
+            except Exception as e:
+                logger.error(f"Backfill market fetch error at offset {offset}: {e}")
+                backfill_state["errors"] += 1
+                backfill_state["last_error"] = str(e)
+                offset += 100
+                time.sleep(2)
+
+        backfill_state["markets_found"] = len(all_markets)
+        logger.info(f"Backfill: found {len(all_markets)} total resolved markets")
+
+        # Step 3: Filter to markets we don't have yet
+        new_markets = [m for m in all_markets if m["condition_id"] not in existing_cids]
+        logger.info(f"Backfill: {len(new_markets)} new markets to process ({len(all_markets) - len(new_markets)} already in DB)")
+        backfill_state["markets_skipped"] = len(all_markets) - len(new_markets)
+
+        # Step 4: Save market metadata for ALL markets
+        if DATABASE_URL:
+            db_save_markets(all_markets)
+            logger.info(f"  Market metadata saved for {len(all_markets)} markets")
+
+        # Step 5: Fetch trades for new markets and save in batches
+        batch_trades = []
+        batch_size = 20  # Save to DB every 20 markets
+
+        for i, mkt in enumerate(new_markets):
+            cid = mkt["condition_id"]
+            try:
+                data = api_get(f"{DATA_API}/trades", {
+                    "market": cid, "limit": TRADES_PER_MARKET,
+                })
+
+                if data and isinstance(data, list):
+                    for t in data:
+                        wallet = t.get("proxyWallet") or t.get("maker") or t.get("taker") or ""
+                        price = float(t.get("price", 0) or 0)
+                        size = float(t.get("size", 0) or 0)
+                        if not wallet or price <= 0 or size <= 0:
+                            continue
+
+                        batch_trades.append({
+                            "wallet": wallet,
+                            "side": t.get("side", "BUY"),
+                            "price": price,
+                            "size": size,
+                            "timestamp": int(t.get("timestamp", 0) or 0),
+                            "condition_id": cid,
+                            "outcome": t.get("outcome", ""),
+                            "title": t.get("title", mkt["question"]),
+                            "category": mkt["category"],
+                            "winning_outcome": mkt["winning_outcome"],
+                        })
+
+            except Exception as e:
+                logger.debug(f"Backfill trade fetch error for {cid[:12]}: {e}")
+                backfill_state["errors"] += 1
+                backfill_state["last_error"] = str(e)
+
+            backfill_state["markets_processed"] = i + 1
+
+            # Save batch to DB periodically
+            if (i + 1) % batch_size == 0 or i == len(new_markets) - 1:
+                if batch_trades and DATABASE_URL:
+                    inserted = db_save_trades(batch_trades)
+                    backfill_state["trades_ingested"] += inserted
+                    logger.info(f"  Backfill batch: {i+1}/{len(new_markets)} markets, +{inserted} trades (total: {backfill_state['trades_ingested']})")
+                    batch_trades = []
+
+                backfill_state["progress"] = (
+                    f"Processing: {i+1}/{len(new_markets)} new markets "
+                    f"({backfill_state['trades_ingested']:,} trades ingested, "
+                    f"{backfill_state['errors']} errors)"
+                )
+
+            # Brief pause to avoid rate limiting
+            if (i + 1) % 50 == 0:
+                time.sleep(1)
+
+        backfill_state["finished_at"] = datetime.utcnow().isoformat()
+        backfill_state["running"] = False
+        backfill_state["progress"] = (
+            f"Complete! {backfill_state['markets_processed']} markets processed, "
+            f"{backfill_state['trades_ingested']:,} new trades ingested, "
+            f"{backfill_state['markets_skipped']} skipped (already had data)"
+        )
+
+        # Save a pipeline run record for the backfill
+        if DATABASE_URL:
+            db_save_pipeline_run({
+                "markets": backfill_state["markets_found"],
+                "trades": backfill_state["trades_ingested"],
+                "wallets": 0, "convergence": 0, "intel": 0,
+                "status": "backfill_complete",
+                "notes": backfill_state["progress"],
+            })
+
+        logger.info(f"Backfill complete: {backfill_state['progress']}")
+
+        # Send Telegram notification
+        tg_send(
+            f"📦 <b>BACKFILL COMPLETE</b>\n\n"
+            f"📊 Markets found: {backfill_state['markets_found']:,}\n"
+            f"🆕 New markets: {backfill_state['markets_processed']:,}\n"
+            f"⏭ Skipped (existing): {backfill_state['markets_skipped']:,}\n"
+            f"📈 Trades ingested: {backfill_state['trades_ingested']:,}\n"
+            f"❌ Errors: {backfill_state['errors']}\n\n"
+            f"💾 Total trades in DB: {db_get_trade_count():,}"
+        )
+
+    except Exception as e:
+        logger.error(f"Backfill fatal error: {e}", exc_info=True)
+        backfill_state["running"] = False
+        backfill_state["last_error"] = str(e)
+        backfill_state["progress"] = f"Error: {e}"
+
+
+@app.get("/api/backfill/start")
+def start_backfill(max_markets: int = Query(10000), min_volume: int = Query(500)):
+    """Start a historical backfill job."""
+    if not DATABASE_URL:
+        return {"status": "error", "message": "No database configured"}
+    if backfill_state["running"]:
+        return {"status": "already_running", "progress": backfill_state["progress"]}
+
+    thread = threading.Thread(target=run_backfill, args=(max_markets, min_volume), daemon=True)
+    thread.start()
+
+    return {
+        "status": "started",
+        "message": f"Backfill started. Fetching up to {max_markets} markets with min volume ${min_volume}. Check /api/backfill/status for progress.",
+    }
+
+
+@app.get("/api/backfill/status")
+def backfill_status():
+    """Check backfill progress."""
+    return {
+        **backfill_state,
+        "db_total_trades": db_get_trade_count() if DATABASE_URL else 0,
+    }
 
 
 # ================================================================
