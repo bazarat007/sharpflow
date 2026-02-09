@@ -26,8 +26,8 @@ function useApi(ep,interval=60000){
   return data;
 }
 
-const TC={elite:"#00f5a0",sharp:"#f5c842",average:"#8a9bb5",dull:"#f54242"};
-const TL={elite:"\u26a1 ELITE",sharp:"\ud83d\udcca SHARP",average:"\u2696\ufe0f AVG",dull:"\u274c DULL"};
+const TC={sharp:"#00f5a0",average:"#8a9bb5",dull:"#f54242"};
+const TL={sharp:"\ud83d\udcca SHARP",average:"\u2696\ufe0f AVG",dull:"\u274c DULL"};
 const CE={sports:"\ud83c\udfc0",politics:"\ud83c\udfdb\ufe0f",other:"\ud83d\udcca"};
 
 function Badge({tier}){
@@ -112,7 +112,6 @@ function MktCard({m}){
   const gap=m.price_gap,div=m.divergence;
   const dc={YES:{c:"#00f5a0",a:"\u25b2",label:"YES"},NO:{c:"#f54242",a:"\u25bc",label:"NO"},SPLIT:{c:"#5a7a9a",a:"\u25c6",label:"SPLIT"}}[m.smart_direction]||{c:"#5a7a9a",a:"?",label:"?"};
   const totalSharps=m.sharp_yes_count+m.sharp_no_count;
-  const totalElites=(m.elite_yes||0)+(m.elite_no||0);
   const gapAbs=Math.abs(gap);
   // Signal strength: strong if high divergence + big gap + many sharps
   const strong=div>=.3&&gapAbs>=.08&&totalSharps>=3;
@@ -137,7 +136,7 @@ function MktCard({m}){
     {/* Sharp vs Dull bars */}
     <div style={{marginBottom:6}}>
       <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"#5a7a9a",marginBottom:2}}>
-        <span>SHARP ({totalSharps} wallets{totalElites>0?`, ${totalElites}\u26a1`:""}) &mdash; ${(m.sharp_yes_notional+m.sharp_no_notional).toLocaleString("en",{maximumFractionDigits:0})} total</span>
+        <span>SHARP ({totalSharps} wallets) &mdash; ${(m.sharp_yes_notional+m.sharp_no_notional).toLocaleString("en",{maximumFractionDigits:0})} total</span>
         <span style={{color:dc.c}}>{(m.smart_money_yes_pct*100).toFixed(0)}% YES</span></div>
       <Bar pct={m.smart_money_yes_pct} h={7}/>
     </div>
@@ -201,7 +200,7 @@ function App(){
     {tab==="dashboard"&&<div style={{animation:"fadeIn .2s ease"}}>
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(95px,1fr))",gap:8,marginBottom:20}}>
         <Stat value={stats?.wallets_scored||0} label="Wallets"/>
-        <Stat value={tiers.elite||0} label="Elite" color="#00f5a0"/>
+        <Stat value={tiers.sharp||0} label="Sharp" color="#00f5a0"/>
         <Stat value={tiers.sharp||0} label="Sharp" color="#f5c842"/>
         <Stat value={signals.length} label="Convergence" color="#a855f7"/>
         <Stat value={markets.length} label="Mkts Tracked" color="#f5c842"/>
@@ -248,7 +247,7 @@ function App(){
       <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap",alignItems:"center"}}>
         <span style={{fontSize:10,color:"#3a4a5a",marginRight:4}}>TIER:</span>
         <FB v="all" l={`All (${wallets.length})`} set={setWF} cur={wF}/>
-        {["elite","sharp","average","dull"].map(f=><FB key={f} v={f} l={`${f} (${wallets.filter(w=>w.tier===f).length})`} set={setWF} cur={wF}/>)}
+        {["sharp","average","dull"].map(f=><FB key={f} v={f} l={`${f} (${wallets.filter(w=>w.tier===f).length})`} set={setWF} cur={wF}/>)}
         <span style={{fontSize:10,color:"#3a4a5a",marginLeft:12,marginRight:4}}>SORT:</span>
         {["sharpness","pnl","clv","winrate","markets"].map(s=><FB key={s} v={s} l={s} set={setWS} cur={wS}/>)}
       </div>
