@@ -2634,6 +2634,535 @@ def backfill_status():
 
 
 # ================================================================
+# BACKTESTING ENGINE
+# ================================================================
+
+def backtest_score_wallets(trades, weights, min_markets=8):
+    """
+    Score wallets using specified weights. Returns dict of wallet -> {tier, score, ...}.
+    Standalone scoring function for backtesting — doesn't touch global state.
+    """
+    w_clv, w_timing, w_consist, w_roi = weights
+
+    wallet_trades = defaultdict(list)
+    for t in trades:
+        wallet_trades[t["wallet"]].append(t)
+
+    scores = {}
+    for wallet, wtrades in wallet_trades.items():
+        market_groups = defaultdict(list)
+        for t in wtrades:
+            market_groups[t["condition_id"]].append(t)
+
+        distinct = len(market_groups)
+        if distinct < min_markets:
+            continue
+
+        clvs = []
+        timing_scores_list = []
+        market_pnls = {}
+        total_inv = 0.0
+        total_ret = 0.0
+        trade_count = 0
+
+        for cid, mtrades in market_groups.items():
+            mpnl = 0.0
+            for t in mtrades:
+                price = t["price"]
+                side = t["side"]
+                size = t["size"]
+                outcome = (t.get("outcome") or "").lower()
+                win_outcome = (t.get("winning_outcome") or "").lower()
+                if not win_outcome:
+                    continue
+
+                outcome_won = (outcome == win_outcome)
+                res_price = 1.0 if outcome_won else 0.0
+                trade_count += 1
+
+                if side == "BUY":
+                    if price >= 0.95 and outcome_won:
+                        continue
+                    clvs.append(res_price - price)
+                    timing_scores_list.append((0.5 - price) if outcome_won else (price - 0.5))
+                    pnl = (res_price - price) * size
+                    total_inv += price * size
+                    total_ret += res_price * size
+                    mpnl += pnl
+                elif side == "SELL":
+                    clvs.append(price - res_price)
+                    timing_scores_list.append((price - 0.5) if not outcome_won else (0.5 - price))
+                    pnl = (price - res_price) * size
+                    total_inv += (1.0 - price) * size
+                    total_ret += (1.0 - res_price) * size
+                    mpnl += pnl
+
+            market_pnls[cid] = mpnl
+
+        if not clvs or trade_count == 0:
+            continue
+
+        avg_clv = float(np.mean(clvs))
+        clv_score = max(0, min(1, (avg_clv + 0.1) / 0.52))
+
+        early_pct = sum(1 for t in timing_scores_list if t > 0) / len(timing_scores_list) if timing_scores_list else 0
+        timing_score = max(0, min(1, (early_pct - 0.1) / 0.6))
+
+        mkt_won = sum(1 for p in market_pnls.values() if p > 0)
+        win_rate = mkt_won / len(market_pnls) if market_pnls else 0
+        market_count_factor = min(1.0, (distinct / 100) ** 0.5)
+        consistency_score = win_rate * market_count_factor
+
+        total_pnl = total_ret - total_inv
+        roi = total_pnl / total_inv if total_inv > 0 else 0
+        roi_score = max(0, min(1, (roi + 0.2) / 1.0))
+
+        sharpness = w_clv * clv_score + w_timing * timing_score + w_consist * consistency_score + w_roi * roi_score
+
+        if sharpness >= 0.65 and total_pnl > 0 and avg_clv > 0.02 and distinct >= 25:
+            tier = "elite"
+        elif sharpness >= 0.45 and (total_pnl > 0 or (avg_clv > 0.05 and distinct >= 20)):
+            tier = "sharp"
+        elif sharpness >= 0.25:
+            tier = "average"
+        else:
+            tier = "dull"
+
+        scores[wallet] = {
+            "tier": tier,
+            "sharpness": sharpness,
+            "avg_clv": avg_clv,
+            "win_rate": win_rate,
+            "total_pnl": total_pnl,
+            "distinct_markets": distinct,
+        }
+
+    return scores
+
+
+def backtest_score_wallets_v2(trades, weights, min_markets=8):
+    """
+    Alternative scoring: 3-factor model with informational edge (CLV + time-weighted price alpha),
+    consistency, and ROI.
+    """
+    w_edge, w_consist, w_roi = weights
+
+    wallet_trades = defaultdict(list)
+    for t in trades:
+        wallet_trades[t["wallet"]].append(t)
+
+    # Get market time ranges for time-lead calculation
+    market_times = defaultdict(lambda: {"min_ts": float("inf"), "max_ts": 0})
+    for t in trades:
+        cid = t["condition_id"]
+        ts = t.get("timestamp", 0) or 0
+        if ts > 0:
+            market_times[cid]["min_ts"] = min(market_times[cid]["min_ts"], ts)
+            market_times[cid]["max_ts"] = max(market_times[cid]["max_ts"], ts)
+
+    scores = {}
+    for wallet, wtrades in wallet_trades.items():
+        market_groups = defaultdict(list)
+        for t in wtrades:
+            market_groups[t["condition_id"]].append(t)
+
+        distinct = len(market_groups)
+        if distinct < min_markets:
+            continue
+
+        edge_scores = []
+        market_pnls = {}
+        total_inv = 0.0
+        total_ret = 0.0
+        trade_count = 0
+
+        for cid, mtrades in market_groups.items():
+            mpnl = 0.0
+            mt = market_times.get(cid, {})
+            market_duration = mt.get("max_ts", 0) - mt.get("min_ts", 0)
+            if market_duration <= 0:
+                market_duration = 1
+
+            for t in mtrades:
+                price = t["price"]
+                side = t["side"]
+                size = t["size"]
+                outcome = (t.get("outcome") or "").lower()
+                win_outcome = (t.get("winning_outcome") or "").lower()
+                ts = t.get("timestamp", 0) or 0
+                if not win_outcome:
+                    continue
+
+                outcome_won = (outcome == win_outcome)
+                res_price = 1.0 if outcome_won else 0.0
+                trade_count += 1
+
+                # Price alpha
+                if side == "BUY":
+                    if price >= 0.95 and outcome_won:
+                        continue
+                    price_alpha = res_price - price
+                    pnl = (res_price - price) * size
+                    total_inv += price * size
+                    total_ret += res_price * size
+                elif side == "SELL":
+                    price_alpha = price - res_price
+                    pnl = (price - res_price) * size
+                    total_inv += (1.0 - price) * size
+                    total_ret += (1.0 - res_price) * size
+                else:
+                    continue
+
+                mpnl += pnl
+
+                # Time lead factor: how early in the market's life did they enter?
+                # 1.0 = very early, 0.1 = very late
+                if ts > 0 and mt.get("min_ts", 0) > 0:
+                    time_position = (ts - mt["min_ts"]) / market_duration  # 0=earliest, 1=latest
+                    time_lead = max(0.1, 1.0 - time_position * 0.9)
+                else:
+                    time_lead = 0.5
+
+                # Informational edge = price_alpha weighted by time lead
+                edge_scores.append(price_alpha * time_lead)
+
+            market_pnls[cid] = mpnl
+
+        if not edge_scores or trade_count == 0:
+            continue
+
+        avg_edge = float(np.mean(edge_scores))
+        # Normalize: -0.1 = 0, +0.4 = 1
+        edge_score = max(0, min(1, (avg_edge + 0.1) / 0.5))
+
+        mkt_won = sum(1 for p in market_pnls.values() if p > 0)
+        win_rate = mkt_won / len(market_pnls) if market_pnls else 0
+        market_count_factor = min(1.0, (distinct / 100) ** 0.5)
+        consistency_score = win_rate * market_count_factor
+
+        total_pnl = total_ret - total_inv
+        roi = total_pnl / total_inv if total_inv > 0 else 0
+        roi_score = max(0, min(1, (roi + 0.2) / 1.0))
+
+        sharpness = w_edge * edge_score + w_consist * consistency_score + w_roi * roi_score
+
+        if sharpness >= 0.65 and total_pnl > 0 and avg_edge > 0.02 and distinct >= 25:
+            tier = "elite"
+        elif sharpness >= 0.45 and (total_pnl > 0 or (avg_edge > 0.05 and distinct >= 20)):
+            tier = "sharp"
+        elif sharpness >= 0.25:
+            tier = "average"
+        else:
+            tier = "dull"
+
+        scores[wallet] = {
+            "tier": tier,
+            "sharpness": sharpness,
+            "avg_edge": avg_edge,
+            "win_rate": win_rate,
+            "total_pnl": total_pnl,
+            "distinct_markets": distinct,
+        }
+
+    return scores
+
+
+def evaluate_tiers(wallet_scores, test_trades):
+    """
+    Given wallet tier assignments and test-set trades, calculate performance metrics per tier.
+    Returns EV per dollar, win rate, trade count, and profit per tier.
+    """
+    tier_stats = {}
+    for tier in ["elite", "sharp", "average", "dull", "unscored"]:
+        tier_stats[tier] = {
+            "trades": 0,
+            "wins": 0,
+            "total_invested": 0.0,
+            "total_returned": 0.0,
+            "wallets": 0,
+        }
+
+    # Count wallets per tier
+    tier_wallet_counts = defaultdict(int)
+    for w, data in wallet_scores.items():
+        tier_wallet_counts[data["tier"]] += 1
+    for tier, count in tier_wallet_counts.items():
+        if tier in tier_stats:
+            tier_stats[tier]["wallets"] = count
+
+    # Evaluate each test trade
+    for t in test_trades:
+        wallet = t["wallet"]
+        price = t["price"]
+        side = t["side"]
+        size = t["size"]
+        outcome = (t.get("outcome") or "").lower()
+        win_outcome = (t.get("winning_outcome") or "").lower()
+
+        if not win_outcome or price <= 0 or price >= 1.0:
+            continue
+
+        tier = wallet_scores.get(wallet, {}).get("tier", "unscored")
+        if tier not in tier_stats:
+            tier = "unscored"
+
+        outcome_won = (outcome == win_outcome)
+        res_price = 1.0 if outcome_won else 0.0
+
+        if side == "BUY":
+            if price >= 0.95 and outcome_won:
+                continue
+            invested = price * size
+            returned = res_price * size
+        elif side == "SELL":
+            invested = (1.0 - price) * size
+            returned = (1.0 - res_price) * size
+        else:
+            continue
+
+        tier_stats[tier]["trades"] += 1
+        tier_stats[tier]["total_invested"] += invested
+        tier_stats[tier]["total_returned"] += returned
+        if returned > invested:
+            tier_stats[tier]["wins"] += 1
+
+    # Calculate final metrics
+    results = {}
+    for tier, s in tier_stats.items():
+        if s["trades"] == 0:
+            results[tier] = {
+                "wallets": s["wallets"],
+                "trades": 0,
+                "win_rate": None,
+                "ev_per_dollar": None,
+                "total_profit": 0,
+            }
+        else:
+            results[tier] = {
+                "wallets": s["wallets"],
+                "trades": s["trades"],
+                "win_rate": round(s["wins"] / s["trades"], 4),
+                "ev_per_dollar": round(s["total_returned"] / s["total_invested"], 4) if s["total_invested"] > 0 else None,
+                "total_profit": round(s["total_returned"] - s["total_invested"], 2),
+            }
+
+    return results
+
+
+def evaluate_divergence(wallet_scores, test_trades):
+    """
+    For each resolved market in the test set, check if sharp and dull money disagreed.
+    When they did, who won?
+    """
+    sharp_tiers = {"elite", "sharp"}
+    dull_tiers = {"dull"}
+
+    # Group test trades by market
+    market_trades = defaultdict(list)
+    for t in test_trades:
+        if (t.get("winning_outcome") or ""):
+            market_trades[t["condition_id"]].append(t)
+
+    results = {"total_markets": 0, "divergent_markets": 0, "sharp_won": 0, "dull_won": 0, "tie": 0}
+
+    for cid, trades in market_trades.items():
+        sharp_yes = 0.0
+        sharp_no = 0.0
+        dull_yes = 0.0
+        dull_no = 0.0
+
+        win_outcome = ""
+        for t in trades:
+            wallet = t["wallet"]
+            tier = wallet_scores.get(wallet, {}).get("tier", "unscored")
+            outcome = (t.get("outcome") or "").lower()
+            notional = t["price"] * t["size"]
+            win_outcome = (t.get("winning_outcome") or "").lower()
+
+            if tier in sharp_tiers:
+                if outcome == "yes":
+                    sharp_yes += notional
+                else:
+                    sharp_no += notional
+            elif tier in dull_tiers:
+                if outcome == "yes":
+                    dull_yes += notional
+                else:
+                    dull_no += notional
+
+        if not win_outcome:
+            continue
+
+        sharp_total = sharp_yes + sharp_no
+        dull_total = dull_yes + dull_no
+        if sharp_total < 10 or dull_total < 10:
+            continue
+
+        results["total_markets"] += 1
+        sharp_pct_yes = sharp_yes / sharp_total
+        dull_pct_yes = dull_yes / dull_total
+
+        # Divergence = they disagree by 30%+
+        if abs(sharp_pct_yes - dull_pct_yes) < 0.30:
+            continue
+
+        results["divergent_markets"] += 1
+        sharp_direction = "yes" if sharp_pct_yes > 0.5 else "no"
+        dull_direction = "yes" if dull_pct_yes > 0.5 else "no"
+
+        if sharp_direction == win_outcome:
+            results["sharp_won"] += 1
+        elif dull_direction == win_outcome:
+            results["dull_won"] += 1
+        else:
+            results["tie"] += 1
+
+    if results["divergent_markets"] > 0:
+        results["sharp_win_rate"] = round(results["sharp_won"] / results["divergent_markets"], 4)
+    else:
+        results["sharp_win_rate"] = None
+
+    return results
+
+
+@app.get("/api/backtest")
+def run_backtest(
+    cutoff_months: int = Query(3, description="Months ago for train/test split"),
+    min_markets: int = Query(8, description="Minimum markets for a wallet to qualify"),
+):
+    """
+    Run a time-split backtest:
+    1. Score wallets on training data (before cutoff)
+    2. Evaluate their test-set performance (after cutoff)
+    3. Compare V1 (4-factor) vs V2 (3-factor) scoring
+    4. Test divergence signal accuracy
+    """
+    if not DATABASE_URL:
+        return {"error": "No database configured"}
+
+    logger.info(f"Running backtest: cutoff={cutoff_months}mo, min_markets={min_markets}")
+
+    # Load all trades from DB (no time limit — we'll split ourselves)
+    conn = db_conn()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT wallet, condition_id, side, outcome, price, size,
+               timestamp, title, category, winning_outcome
+        FROM trades WHERE winning_outcome IS NOT NULL AND winning_outcome != ''
+        AND price > 0 AND size > 0
+    """)
+    all_trades = [dict(r) for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+
+    if not all_trades:
+        return {"error": "No resolved trades in database"}
+
+    # Split by time
+    cutoff_ts = int((datetime.utcnow() - timedelta(days=cutoff_months * 30)).timestamp())
+    train_trades = [t for t in all_trades if (t.get("timestamp") or 0) < cutoff_ts and (t.get("timestamp") or 0) > 0]
+    test_trades = [t for t in all_trades if (t.get("timestamp") or 0) >= cutoff_ts]
+
+    if len(train_trades) < 1000:
+        return {"error": f"Not enough training data: {len(train_trades)} trades before cutoff"}
+    if len(test_trades) < 500:
+        return {"error": f"Not enough test data: {len(test_trades)} trades after cutoff"}
+
+    logger.info(f"  Train: {len(train_trades):,} trades | Test: {len(test_trades):,} trades")
+
+    # --- V1: Current 4-factor scoring ---
+    v1_weights = (0.40, 0.25, 0.20, 0.15)
+    v1_scores = backtest_score_wallets(train_trades, v1_weights, min_markets)
+    v1_tiers = evaluate_tiers(v1_scores, test_trades)
+    v1_divergence = evaluate_divergence(v1_scores, test_trades)
+
+    # --- V2: 3-factor informational edge scoring ---
+    v2_weights = (0.50, 0.30, 0.20)
+    v2_scores = backtest_score_wallets_v2(train_trades, v2_weights, min_markets)
+    v2_tiers = evaluate_tiers(v2_scores, test_trades)
+    v2_divergence = evaluate_divergence(v2_scores, test_trades)
+
+    # --- V1 alternative weights ---
+    alt_configs = [
+        {"label": "CLV Heavy (60/15/15/10)", "weights": (0.60, 0.15, 0.15, 0.10)},
+        {"label": "Balanced (25/25/25/25)", "weights": (0.25, 0.25, 0.25, 0.25)},
+        {"label": "CLV+Timing (45/35/10/10)", "weights": (0.45, 0.35, 0.10, 0.10)},
+    ]
+    alt_results = []
+    for cfg in alt_configs:
+        alt_scores = backtest_score_wallets(train_trades, cfg["weights"], min_markets)
+        alt_tiers = evaluate_tiers(alt_scores, test_trades)
+        # Key metric: elite EV per dollar
+        elite_ev = alt_tiers.get("elite", {}).get("ev_per_dollar")
+        sharp_ev = alt_tiers.get("sharp", {}).get("ev_per_dollar")
+        dull_ev = alt_tiers.get("dull", {}).get("ev_per_dollar")
+        alt_results.append({
+            "label": cfg["label"],
+            "weights": cfg["weights"],
+            "elite_ev": elite_ev,
+            "sharp_ev": sharp_ev,
+            "dull_ev": dull_ev,
+            "elite_trades": alt_tiers.get("elite", {}).get("trades", 0),
+            "sharp_trades": alt_tiers.get("sharp", {}).get("trades", 0),
+            "tier_counts": {t: alt_tiers[t]["wallets"] for t in alt_tiers},
+        })
+
+    # --- Baseline: what if you just followed market consensus? ---
+    baseline_invested = 0.0
+    baseline_returned = 0.0
+    for t in test_trades:
+        price = t["price"]
+        outcome = (t.get("outcome") or "").lower()
+        win_outcome = (t.get("winning_outcome") or "").lower()
+        size = t["size"]
+        if not win_outcome or price <= 0 or price >= 1.0:
+            continue
+        # Market consensus = buying at current price
+        outcome_won = (outcome == win_outcome)
+        res_price = 1.0 if outcome_won else 0.0
+        baseline_invested += price * size
+        baseline_returned += res_price * size
+
+    baseline_ev = round(baseline_returned / baseline_invested, 4) if baseline_invested > 0 else None
+
+    cutoff_date = (datetime.utcnow() - timedelta(days=cutoff_months * 30)).strftime("%Y-%m-%d")
+
+    result = {
+        "config": {
+            "cutoff_date": cutoff_date,
+            "cutoff_months": cutoff_months,
+            "min_markets": min_markets,
+            "train_trades": len(train_trades),
+            "test_trades": len(test_trades),
+        },
+        "baseline": {
+            "ev_per_dollar": baseline_ev,
+            "description": "Average EV if you copied every trade at its entry price",
+        },
+        "v1_current_model": {
+            "name": "4-Factor (CLV 40%, Timing 25%, Consistency 20%, ROI 15%)",
+            "tiers": v1_tiers,
+            "divergence": v1_divergence,
+        },
+        "v2_edge_model": {
+            "name": "3-Factor (Informational Edge 50%, Consistency 30%, ROI 20%)",
+            "tiers": v2_tiers,
+            "divergence": v2_divergence,
+        },
+        "weight_experiments": alt_results,
+        "interpretation": {
+            "ev_per_dollar": "Above 1.0 = profitable. 1.10 means 10% return per dollar invested.",
+            "divergence_sharp_win_rate": "When sharp & dull disagree by 30%+, how often does the sharp side win?",
+            "what_to_look_for": "Elite EV should be highest, Dull lowest. Bigger gap = better scoring system. Sharp win rate in divergence > 55% = real signal.",
+        },
+    }
+
+    logger.info(f"Backtest complete. V1 elite EV: {v1_tiers.get('elite', {}).get('ev_per_dollar')} | V2 elite EV: {v2_tiers.get('elite', {}).get('ev_per_dollar')}")
+
+    return result
+
+
+# ================================================================
 # REACT SPA DASHBOARD
 # ================================================================
 
