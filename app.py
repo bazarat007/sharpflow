@@ -967,14 +967,14 @@ def score_all_wallets(trades, markets_lookup):
         sharpness = W_CLV * clv_score + W_TIMING * timing_score + W_CONSISTENCY * consistency_score + W_ROI * roi_score
 
         # Tier assignment with sanity checks:
-        # - Elite requires positive PnL AND positive CLV AND 12+ markets
-        # - Sharp requires positive PnL OR (positive CLV with 15+ markets)
-        # - This prevents wallets with high timing/consistency but no actual edge from ranking up
-        if sharpness >= 0.55 and total_pnl > 0 and avg_clv > 0 and distinct >= 12:
+        # - Elite: truly exceptional — high score, profitable, strong CLV, active across many markets
+        # - Sharp: consistently above average with demonstrated edge
+        # - Thresholds tuned for large dataset (10K+ markets, 100K+ wallets)
+        if sharpness >= 0.65 and total_pnl > 0 and avg_clv > 0.02 and distinct >= 25:
             tier = "elite"
-        elif sharpness >= 0.38 and (total_pnl > 0 or (avg_clv > 0.05 and distinct >= 15)):
+        elif sharpness >= 0.45 and (total_pnl > 0 or (avg_clv > 0.05 and distinct >= 20)):
             tier = "sharp"
-        elif sharpness >= 0.22:
+        elif sharpness >= 0.25:
             tier = "average"
         else:
             tier = "dull"
