@@ -48,16 +48,17 @@ DATA_API = "https://data-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 
 # Scoring weights
-W_CLV = 0.40
+W_CLV = 0.25
 W_TIMING = 0.25
-W_CONSISTENCY = 0.20
-W_ROI = 0.15
+W_CONSISTENCY = 0.25
+W_ROI = 0.25
 
-MIN_MARKETS = 8            # Lowered: minimum distinct resolved markets to score a wallet
-MARKETS_TO_FETCH = 750     # Increased: how many resolved markets to analyze
+MIN_MARKETS = 15           # Raised: minimum distinct resolved markets to score a wallet (backtest validated)
+MARKETS_TO_FETCH = 750     # How many resolved markets to fetch from API
 TRADES_PER_MARKET = 500    # Max trades per market
-MIN_VOLUME = 2000          # Lowered: minimum market volume (USD)
+MIN_VOLUME = 2000          # Minimum market volume (USD)
 API_DELAY = 0.3            # Slightly faster
+SCORING_WINDOW_MONTHS = 6  # Only score wallets on trades from last N months
 
 # Category keywords
 SPORTS_KW = ["sports","nfl","nba","mlb","nhl","soccer","football","basketball",
@@ -966,13 +967,12 @@ def score_all_wallets(trades, markets_lookup):
 
         sharpness = W_CLV * clv_score + W_TIMING * timing_score + W_CONSISTENCY * consistency_score + W_ROI * roi_score
 
-        # Tier assignment with sanity checks:
-        # - Elite: truly exceptional — high score, profitable, strong CLV, active across many markets
-        # - Sharp: consistently above average with demonstrated edge
-        # - Thresholds tuned for large dataset (10K+ markets, 100K+ wallets)
-        if sharpness >= 0.65 and total_pnl > 0 and avg_clv > 0.02 and distinct >= 25:
-            tier = "elite"
-        elif sharpness >= 0.45 and (total_pnl > 0 or (avg_clv > 0.05 and distinct >= 20)):
+        # Tier assignment — backtest validated:
+        # - No elite tier (overfits to historical data)
+        # - Sharp: strong score + profitable + sufficient markets
+        # - Average: moderate score
+        # - Dull: everything else
+        if sharpness >= 0.45 and total_pnl > 0 and avg_clv > 0 and distinct >= 15:
             tier = "sharp"
         elif sharpness >= 0.25:
             tier = "average"
@@ -1286,9 +1286,9 @@ def detect_convergence(scored_wallets, trades):
                 0.25 * min(1, total_notional / 5000)          # More money committed = stronger
             )
 
-            if elite_count >= 2 and len(unique_wallets) >= 4:
+            if sharp_count >= 5 and len(unique_wallets) >= 6:
                 sig_type = "STRONG_CONVERGENCE"
-            elif elite_count >= 1 or (sharp_count >= 2 and len(unique_wallets) >= 4):
+            elif sharp_count >= 3 and len(unique_wallets) >= 4:
                 sig_type = "CONVERGENCE"
             else:
                 sig_type = "MILD_CONVERGENCE"
@@ -1818,17 +1818,21 @@ def alert_high_divergence(intel_markets):
     state["_alerted_divergence"] = new_alerted
 
 
-def alert_elite_moves(scored_wallets):
-    """Alert 3: Elite wallet takes a large new position (>$500 notional)."""
-    elite_wallets = [w for w in scored_wallets if w["tier"] == "elite"]
-    if not elite_wallets:
+def alert_sharp_moves(scored_wallets):
+    """Alert 3: Top sharp wallet takes a large new position (>$500 notional)."""
+    # Track top 20 sharp wallets by sharpness score
+    sharp_wallets = sorted(
+        [w for w in scored_wallets if w["tier"] == "sharp"],
+        key=lambda w: w["sharpness_score"], reverse=True
+    )[:20]
+    if not sharp_wallets:
         return
 
     # Track previously seen positions to detect new ones
-    prev_positions = state.get("_elite_positions", {})
+    prev_positions = state.get("_sharp_positions", {})
     current_positions = {}
 
-    for wdata in elite_wallets:
+    for wdata in sharp_wallets:
         wallet_addr = wdata["wallet"]
         try:
             positions = api_get(f"{DATA_API}/positions", {"user": wallet_addr, "sizeThreshold": 10})
@@ -1852,12 +1856,12 @@ def alert_elite_moves(scored_wallets):
                     title = pos.get("title", "") or pos.get("eventTitle", "Unknown market")
 
                     tg_send(
-                        f"🐋 <b>ELITE WALLET MOVE</b>\n\n"
-                        f"👛 <b>{wdata['display_name']}</b> (Score: {wdata['sharpness_score']*100:.0f})\n"
-                        f"📊 {title[:70]}\n"
-                        f"📍 Side: <b>{outcome}</b>\n"
-                        f"💰 Position: <b>${notional:,.0f}</b>\n"
-                        f"📈 Avg entry: ${avg_price:.2f}"
+                        f"\U0001f40b <b>SHARP WALLET MOVE</b>\n\n"
+                        f"\U0001f45b <b>{wdata['display_name']}</b> (Score: {wdata['sharpness_score']*100:.0f})\n"
+                        f"\U0001f4ca {title[:70]}\n"
+                        f"\U0001f4cd Side: <b>{outcome}</b>\n"
+                        f"\U0001f4b0 Position: <b>${notional:,.0f}</b>\n"
+                        f"\U0001f4c8 Avg entry: ${avg_price:.2f}"
                     )
                 # Alert if position grew significantly (>50% increase)
                 elif notional > prev_positions[pos_key] * 1.5:
@@ -1866,17 +1870,17 @@ def alert_elite_moves(scored_wallets):
                     prev_val = prev_positions[pos_key]
 
                     tg_send(
-                        f"🐋 <b>ELITE ADDING TO POSITION</b>\n\n"
-                        f"👛 <b>{wdata['display_name']}</b> (Score: {wdata['sharpness_score']*100:.0f})\n"
-                        f"📊 {title[:70]}\n"
-                        f"📍 Side: <b>{outcome}</b>\n"
-                        f"💰 ${prev_val:,.0f} → <b>${notional:,.0f}</b> (+{(notional/prev_val-1)*100:.0f}%)"
+                        f"\U0001f40b <b>SHARP ADDING TO POSITION</b>\n\n"
+                        f"\U0001f45b <b>{wdata['display_name']}</b> (Score: {wdata['sharpness_score']*100:.0f})\n"
+                        f"\U0001f4ca {title[:70]}\n"
+                        f"\U0001f4cd Side: <b>{outcome}</b>\n"
+                        f"\U0001f4b0 ${prev_val:,.0f} \u2192 <b>${notional:,.0f}</b> (+{(notional/prev_val-1)*100:.0f}%)"
                     )
 
         except Exception as e:
-            logger.debug(f"Failed scanning elite {wallet_addr[:10]}: {e}")
+            logger.debug(f"Failed scanning sharp {wallet_addr[:10]}: {e}")
 
-    state["_elite_positions"] = current_positions
+    state["_sharp_positions"] = current_positions
 
 
 def send_daily_digest(scored_wallets, intel_markets, signals):
@@ -1965,7 +1969,7 @@ def run_pipeline():
             state["progress"] = "Loading historical trades from database..."
             logger.info("Loading historical trades from database...")
             try:
-                db_trades = db_get_all_trades()
+                db_trades = db_get_all_trades(SCORING_WINDOW_MONTHS)
                 if db_trades:
                     # Build a set of existing trade signatures to avoid duplicates
                     existing_sigs = set()
@@ -2067,7 +2071,7 @@ def run_pipeline():
         alert_high_divergence(intel)
 
         # Alert 3: Elite wallet moves
-        alert_elite_moves(scored)
+        alert_sharp_moves(scored)
 
         # Alert 4: Daily digest (once per day)
         send_daily_digest(scored, intel, signals)
