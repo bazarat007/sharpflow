@@ -2637,7 +2637,7 @@ def backfill_status():
 # BACKTESTING ENGINE
 # ================================================================
 
-def backtest_score_wallets(trades, weights, min_markets=8):
+def backtest_score_wallets(trades, weights, min_markets=8, elite_score=0.65, elite_markets=25, sharp_score=0.45):
     """
     Score wallets using specified weights. Returns dict of wallet -> {tier, score, ...}.
     Standalone scoring function for backtesting — doesn't touch global state.
@@ -2719,9 +2719,9 @@ def backtest_score_wallets(trades, weights, min_markets=8):
 
         sharpness = w_clv * clv_score + w_timing * timing_score + w_consist * consistency_score + w_roi * roi_score
 
-        if sharpness >= 0.65 and total_pnl > 0 and avg_clv > 0.02 and distinct >= 25:
+        if sharpness >= elite_score and total_pnl > 0 and avg_clv > 0.02 and distinct >= elite_markets:
             tier = "elite"
-        elif sharpness >= 0.45 and (total_pnl > 0 or (avg_clv > 0.05 and distinct >= 20)):
+        elif sharpness >= sharp_score and (total_pnl > 0 or (avg_clv > 0.05 and distinct >= 20)):
             tier = "sharp"
         elif sharpness >= 0.25:
             tier = "average"
@@ -3029,6 +3029,9 @@ def evaluate_divergence(wallet_scores, test_trades):
 def run_backtest(
     cutoff_months: int = Query(3, description="Months ago for train/test split"),
     min_markets: int = Query(8, description="Minimum markets for a wallet to qualify"),
+    elite_score: float = Query(0.55, description="Minimum sharpness for elite tier"),
+    elite_markets: int = Query(12, description="Minimum markets for elite tier"),
+    sharp_score: float = Query(0.38, description="Minimum sharpness for sharp tier"),
 ):
     """
     Run a time-split backtest:
@@ -3072,7 +3075,7 @@ def run_backtest(
 
     # --- V1: Current 4-factor scoring ---
     v1_weights = (0.40, 0.25, 0.20, 0.15)
-    v1_scores = backtest_score_wallets(train_trades, v1_weights, min_markets)
+    v1_scores = backtest_score_wallets(train_trades, v1_weights, min_markets, elite_score, elite_markets, sharp_score)
     v1_tiers = evaluate_tiers(v1_scores, test_trades)
     v1_divergence = evaluate_divergence(v1_scores, test_trades)
 
@@ -3090,7 +3093,7 @@ def run_backtest(
     ]
     alt_results = []
     for cfg in alt_configs:
-        alt_scores = backtest_score_wallets(train_trades, cfg["weights"], min_markets)
+        alt_scores = backtest_score_wallets(train_trades, cfg["weights"], min_markets, elite_score, elite_markets, sharp_score)
         alt_tiers = evaluate_tiers(alt_scores, test_trades)
         # Key metric: elite EV per dollar
         elite_ev = alt_tiers.get("elite", {}).get("ev_per_dollar")
@@ -3132,6 +3135,9 @@ def run_backtest(
             "cutoff_date": cutoff_date,
             "cutoff_months": cutoff_months,
             "min_markets": min_markets,
+            "elite_score": elite_score,
+            "elite_markets": elite_markets,
+            "sharp_score": sharp_score,
             "train_trades": len(train_trades),
             "test_trades": len(test_trades),
         },
