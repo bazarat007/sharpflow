@@ -28,7 +28,7 @@ function useApi(ep,interval=60000){
 
 const TC={sharp:"#00f5a0",average:"#8a9bb5",dull:"#f54242"};
 const TL={sharp:"\ud83d\udcca SHARP",average:"\u2696\ufe0f AVG",dull:"\u274c DULL"};
-const CE={sports:"\ud83c\udfc0",politics:"\ud83c\udfdb\ufe0f",other:"\ud83d\udcca"};
+const CE={sports:"\ud83c\udfc0",politics:"\ud83c\udfdb\ufe0f",other:"\ud83d\udcca",nba:"\ud83c\udfc0",nfl:"\ud83c\udfc8",mlb:"\u26be",nhl:"\ud83c\udfd2",soccer:"\u26bd",ufc:"\ud83e\udd4a"};
 
 function Badge({tier}){
   const c=TC[tier]||"#5a7a9a";
@@ -95,7 +95,6 @@ function WalletRow({w,rank}){
             <span style={{color:"#3a4a5a",marginLeft:4}}>{cs.markets}m {(cs.win_rate*100).toFixed(0)}%wr</span>
           </div>)}
       </div>}
-      </div>
       {ld&&<div style={{color:"#3a4a5a",fontSize:12,padding:8}}>Loading...</div>}
       {live&&<>
         {live.positions?.length>0&&<div style={{marginBottom:12}}>
@@ -130,7 +129,7 @@ function MktCard({m}){
   return <div style={{background:"#0a1018",border:`1px solid ${borderColor}`,borderRadius:8,padding:14,transition:"border-color .2s"}}>
     {/* Header: Question + Smart Money Direction */}
     <div style={{marginBottom:10}}>
-      <div style={{fontSize:13,fontWeight:600,color:"#e8edf2",lineHeight:1.4,marginBottom:6}}>{CE[m.category]||"\ud83d\udcca"} {m.question?.slice(0,70)}</div>
+      <div style={{fontSize:13,fontWeight:600,color:"#e8edf2",lineHeight:1.4,marginBottom:6}}>{CE[m.sub_category]||CE[m.category]||"\ud83d\udcca"} {m.sub_category?<span style={{fontSize:10,color:"#5a7a9a",textTransform:"uppercase",marginRight:4}}>{m.sub_category}</span>:null}{m.question?.slice(0,70)}</div>
       <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
         <div style={{background:dc.c+"18",color:dc.c,padding:"4px 10px",borderRadius:5,fontSize:14,fontWeight:800,fontFamily:"'JetBrains Mono',monospace"}}>
           {dc.a} Smart Money: {dc.label} {(m.smart_money_yes_pct*100).toFixed(0)}%
@@ -210,7 +209,6 @@ function App(){
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(95px,1fr))",gap:8,marginBottom:20}}>
         <Stat value={stats?.wallets_scored||0} label="Wallets"/>
         <Stat value={tiers.sharp||0} label="Sharp" color="#00f5a0"/>
-        <Stat value={tiers.sharp||0} label="Sharp" color="#f5c842"/>
         <Stat value={signals.length} label="Convergence" color="#a855f7"/>
         <Stat value={markets.length} label="Mkts Tracked" color="#f5c842"/>
         <Stat value={stats?.markets_analyzed||0} label="Analyzed" color="#5a7a9a"/>
@@ -219,7 +217,7 @@ function App(){
         <h2 style={{fontSize:13,fontWeight:700,color:"#a855f7",marginBottom:8,letterSpacing:1}}>{"\ud83c\udfaf"} CONVERGENCE SIGNALS</h2>
         {signals.slice(0,5).map((s,i)=><div key={i} style={{background:"#0a1018",border:"1px solid #1a2a3a",borderRadius:6,padding:12,marginBottom:6,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
           <div style={{flex:1}}><div style={{fontSize:13,color:"#e8edf2",fontWeight:600}}>{s.market_title?.slice(0,60)}</div>
-            <div style={{fontSize:10,color:"#3a4a5a",marginTop:2}}>{s.wallet_count} wallets ({s.elite_count}{"\u26a1"}) &middot; Strength: {s.strength?.toFixed(2)}</div></div>
+            <div style={{fontSize:10,color:"#3a4a5a",marginTop:2}}>{s.wallet_count} sharp wallets &middot; Strength: {s.strength?.toFixed(2)}</div></div>
           <div style={{fontWeight:800,fontSize:16,color:s.side==="YES"?"#00f5a0":"#f54242"}}>{s.side}</div></div>)}
       </div>}
       <div style={{marginBottom:20}}>
