@@ -982,6 +982,94 @@ def score_all_wallets(trades, markets_lookup):
         sample = wtrades[0]
         name = sample.get("pseudonym") or sample.get("name") or wallet[:12] + "..."
 
+        # Category-specific scoring
+        # Group trades by category and score each independently
+        cat_trades = defaultdict(list)
+        for t in wtrades:
+            cat_trades[t.get("category", "other")].append(t)
+
+        category_scores = {}
+        CAT_MIN_MARKETS = 8  # Lower threshold per category
+
+        for cat, ctrades in cat_trades.items():
+            cat_market_groups = defaultdict(list)
+            for t in ctrades:
+                cat_market_groups[t["condition_id"]].append(t)
+
+            cat_distinct = len(cat_market_groups)
+            if cat_distinct < CAT_MIN_MARKETS:
+                continue
+
+            cat_clvs = []
+            cat_timing = []
+            cat_market_pnls = {}
+            cat_inv = 0.0
+            cat_ret = 0.0
+
+            for cid, mtrades in cat_market_groups.items():
+                mpnl = 0.0
+                for t in mtrades:
+                    p = t["price"]
+                    s = t["side"]
+                    sz = t["size"]
+                    o = (t.get("outcome") or "").lower()
+                    wo = (t.get("winning_outcome") or "").lower()
+                    if not wo:
+                        continue
+                    ow = (o == wo)
+                    rp = 1.0 if ow else 0.0
+
+                    if s == "BUY":
+                        if p >= 0.95 and ow:
+                            continue
+                        cat_clvs.append(rp - p)
+                        cat_timing.append((0.5 - p) if ow else (p - 0.5))
+                        pnl = (rp - p) * sz
+                        cat_inv += p * sz
+                        cat_ret += rp * sz
+                        mpnl += pnl
+                    elif s == "SELL":
+                        cat_clvs.append(p - rp)
+                        cat_timing.append((p - 0.5) if not ow else (0.5 - p))
+                        pnl = (p - rp) * sz
+                        cat_inv += (1.0 - p) * sz
+                        cat_ret += (1.0 - rp) * sz
+                        mpnl += pnl
+                cat_market_pnls[cid] = mpnl
+
+            if not cat_clvs:
+                continue
+
+            c_avg_clv = float(np.mean(cat_clvs))
+            c_clv_score = max(0, min(1, (c_avg_clv + 0.1) / 0.52))
+            c_early_pct = sum(1 for t in cat_timing if t > 0) / len(cat_timing) if cat_timing else 0
+            c_timing_score = max(0, min(1, (c_early_pct - 0.1) / 0.6))
+            c_mkt_won = sum(1 for p in cat_market_pnls.values() if p > 0)
+            c_win_rate = c_mkt_won / len(cat_market_pnls) if cat_market_pnls else 0
+            c_mkt_factor = min(1.0, (cat_distinct / 50) ** 0.5)
+            c_consist = c_win_rate * c_mkt_factor
+            c_pnl = cat_ret - cat_inv
+            c_roi = c_pnl / cat_inv if cat_inv > 0 else 0
+            c_roi_score = max(0, min(1, (c_roi + 0.2) / 1.0))
+
+            c_sharpness = W_CLV * c_clv_score + W_TIMING * c_timing_score + W_CONSISTENCY * c_consist + W_ROI * c_roi_score
+
+            if c_sharpness >= 0.45 and c_pnl > 0 and c_avg_clv > 0:
+                c_tier = "sharp"
+            elif c_sharpness >= 0.25:
+                c_tier = "average"
+            else:
+                c_tier = "dull"
+
+            category_scores[cat] = {
+                "tier": c_tier,
+                "sharpness": round(c_sharpness, 4),
+                "markets": cat_distinct,
+                "win_rate": round(c_win_rate, 4),
+                "pnl": round(c_pnl, 2),
+                "avg_clv": round(c_avg_clv, 4),
+            }
+
         results.append({
             "wallet": wallet,
             "display_name": name,
@@ -1003,6 +1091,7 @@ def score_all_wallets(trades, markets_lookup):
             "markets_won": mkt_won,
             "markets_lost": mkt_lost,
             "categories": sorted(categories),
+            "category_scores": category_scores,
             "scored_at": datetime.utcnow().isoformat(),
         })
 
@@ -1013,7 +1102,16 @@ def score_all_wallets(trades, markets_lookup):
     tiers = defaultdict(int)
     for r in results:
         tiers[r["tier"]] += 1
+
+    # Count category-specific sharps
+    cat_sharp_counts = defaultdict(int)
+    for r in results:
+        for cat, cs in r.get("category_scores", {}).items():
+            if cs["tier"] == "sharp":
+                cat_sharp_counts[cat] += 1
+
     logger.info(f"Scored {len(results)} wallets: {dict(tiers)}")
+    logger.info(f"  Category-specific sharps: {dict(cat_sharp_counts)}")
     logger.info(f"  Diagnostics: {dict(skip_reasons)}")
     logger.info(f"  Max distinct markets any wallet had: {max_distinct}")
     logger.info(f"  Threshold: {MIN_MARKETS} markets required")
@@ -1355,9 +1453,26 @@ def compute_market_intelligence(scored_wallets):
     logger.info("Computing market intelligence...")
     state["progress"] = "Computing market intelligence..."
 
-    # Build wallet lookup by tier
+    # Build wallet lookup by tier — including category-specific tiers
     wallet_lookup = {w["wallet"]: w for w in scored_wallets}
-    sharp_addrs = {w["wallet"] for w in scored_wallets if w["tier"] in ("elite", "sharp")}
+
+    # For category-specific sharp detection
+    def is_sharp_for_category(wallet_data, category):
+        """Check if wallet is sharp overall OR sharp in this specific category."""
+        if wallet_data["tier"] == "sharp":
+            return True
+        cat_scores = wallet_data.get("category_scores", {})
+        if category in cat_scores and cat_scores[category]["tier"] == "sharp":
+            return True
+        return False
+
+    sharp_addrs = {w["wallet"] for w in scored_wallets if w["tier"] == "sharp"}
+    # Also include wallets that are sharp in ANY category
+    for w in scored_wallets:
+        for cat, cs in w.get("category_scores", {}).items():
+            if cs["tier"] == "sharp":
+                sharp_addrs.add(w["wallet"])
+
     dull_addrs = {w["wallet"] for w in scored_wallets if w["tier"] == "dull"}
     avg_addrs = {w["wallet"] for w in scored_wallets if w["tier"] == "average"}
 
@@ -1423,11 +1538,14 @@ def compute_market_intelligence(scored_wallets):
         "avg_yes": [], "avg_no": [],
     })
 
-    wallets_to_scan = [w for w in scored_wallets if w["tier"] in ("elite", "sharp", "dull")]
+    wallets_to_scan = [w for w in scored_wallets if w["tier"] == "sharp"]
+    # Also include wallets that are sharp in any category but not overall sharp
+    cat_sharp_wallets = [w for w in scored_wallets if w["tier"] != "sharp"
+                         and any(cs["tier"] == "sharp" for cs in w.get("category_scores", {}).values())]
     # Limit dull wallet scanning to top 100 by trade count (most active)
     dull_wallets = sorted([w for w in scored_wallets if w["tier"] == "dull"],
                           key=lambda w: w["total_trades"], reverse=True)[:100]
-    sharp_wallets_list = [w for w in scored_wallets if w["tier"] in ("elite", "sharp")]
+    sharp_wallets_list = wallets_to_scan + cat_sharp_wallets
     scan_list = sharp_wallets_list + dull_wallets
 
     scanned = 0
@@ -1451,12 +1569,17 @@ def compute_market_intelligence(scored_wallets):
 
                 outcome = (pos.get("outcome", "") or "").lower()
                 tier = wdata["tier"]
+                # Check category-specific sharpness for this market's category
+                mkt_category = active_markets[cid].get("category", "other")
+                is_cat_sharp = is_sharp_for_category(wdata, mkt_category)
 
                 entry = {
                     "wallet": wallet_addr,
                     "display_name": wdata["display_name"],
                     "tier": tier,
+                    "is_category_sharp": is_cat_sharp,
                     "sharpness_score": wdata["sharpness_score"],
+                    "category_sharpness": wdata.get("category_scores", {}).get(mkt_category, {}).get("sharpness", 0),
                     "size": size,
                     "avg_price": avg_price,
                     "notional": round(notional, 2),
@@ -1464,7 +1587,12 @@ def compute_market_intelligence(scored_wallets):
 
                 is_yes = outcome in ("yes", "y", "1", "")
 
-                if tier in ("elite", "sharp"):
+                if is_cat_sharp:
+                    if is_yes:
+                        market_positions[cid]["sharp_yes"].append(entry)
+                    else:
+                        market_positions[cid]["sharp_no"].append(entry)
+                elif tier == "dull":
                     if is_yes:
                         market_positions[cid]["sharp_yes"].append(entry)
                     else:
@@ -1505,9 +1633,9 @@ def compute_market_intelligence(scored_wallets):
         dy = dedup(pos["dull_yes"])
         dn = dedup(pos["dull_no"])
 
-        # Need at least 1 sharp wallet to be interesting
+        # Need at least 3 sharp wallets (overall or category-specific) to be actionable
         total_sharp = len(sy) + len(sn)
-        if total_sharp == 0:
+        if total_sharp < 3:
             continue
 
         # Compute weighted scores (sharpness-weighted capital)
@@ -1562,9 +1690,9 @@ def compute_market_intelligence(scored_wallets):
             smart_direction = "SPLIT"
             direction_strength = 0.5
 
-        # Count elites
-        elite_yes = [e for e in sy if e["tier"] == "elite"]
-        elite_no = [e for e in sn if e["tier"] == "elite"]
+        # Count category-specific sharps
+        cat_sharp_yes = [e for e in sy if e.get("is_category_sharp")]
+        cat_sharp_no = [e for e in sn if e.get("is_category_sharp")]
 
         intel_results.append({
             "condition_id": cid,
@@ -1582,10 +1710,10 @@ def compute_market_intelligence(scored_wallets):
             "sharp_no_count": len(sn),
             "sharp_yes_notional": round(sum(e["notional"] for e in sy), 2),
             "sharp_no_notional": round(sum(e["notional"] for e in sn), 2),
-            "elite_yes": len(elite_yes),
-            "elite_no": len(elite_no),
-            "sharp_wallets_yes": sorted(sy, key=lambda e: e["sharpness_score"], reverse=True)[:5],
-            "sharp_wallets_no": sorted(sn, key=lambda e: e["sharpness_score"], reverse=True)[:5],
+            "cat_sharp_yes": len(cat_sharp_yes),
+            "cat_sharp_no": len(cat_sharp_no),
+            "sharp_wallets_yes": sorted(sy, key=lambda e: e.get("category_sharpness", e["sharpness_score"]), reverse=True)[:5],
+            "sharp_wallets_no": sorted(sn, key=lambda e: e.get("category_sharpness", e["sharpness_score"]), reverse=True)[:5],
 
             # Dull money
             "dull_money_yes_pct": round(dull_money_yes_pct, 3),
@@ -2128,6 +2256,7 @@ def get_wallets(
     sort: str = Query("sharpness"),
     tier: Optional[str] = Query(None),
     category: Optional[str] = Query(None),
+    cat_sharp: Optional[str] = Query(None, description="Filter to wallets sharp in this category"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ):
@@ -2136,6 +2265,8 @@ def get_wallets(
         wallets = [w for w in wallets if w["tier"] == tier]
     if category:
         wallets = [w for w in wallets if category in w.get("categories", [])]
+    if cat_sharp:
+        wallets = [w for w in wallets if w.get("category_scores", {}).get(cat_sharp, {}).get("tier") == "sharp"]
 
     sort_keys = {
         "sharpness": "sharpness_score", "pnl": "total_pnl",
