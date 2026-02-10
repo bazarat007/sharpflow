@@ -81,11 +81,20 @@ function WalletRow({w,rank}){
     </div>
     {open&&<div style={{padding:"0 8px 16px 44px",animation:"fadeIn .2s ease"}}>
       <div style={{display:"flex",gap:12,marginBottom:12,flexWrap:"wrap"}}>
-        {[{l:"CLV (40%)",v:w.clv_score?.toFixed(2),c:"#00d4ff"},{l:"Timing (25%)",v:w.timing_score?.toFixed(2),c:"#a855f7"},
-          {l:"Consist (20%)",v:w.consistency_score?.toFixed(2),c:"#f5c842"},{l:"ROI (15%)",v:w.roi_score?.toFixed(2),c:"#00f5a0"}].map((s,i)=>
+        {[{l:"CLV (25%)",v:w.clv_score?.toFixed(2),c:"#00d4ff"},{l:"Timing (25%)",v:w.timing_score?.toFixed(2),c:"#a855f7"},
+          {l:"Consist (25%)",v:w.consistency_score?.toFixed(2),c:"#f5c842"},{l:"ROI (25%)",v:w.roi_score?.toFixed(2),c:"#00f5a0"}].map((s,i)=>
           <div key={i} style={{background:"#080e14",border:"1px solid #1a2a3a",borderRadius:6,padding:"6px 10px",textAlign:"center"}}>
             <div className="mono" style={{fontSize:14,fontWeight:700,color:s.c}}>{s.v}</div>
             <div style={{fontSize:9,color:"#3a4a5a",marginTop:2}}>{s.l}</div></div>)}
+      </div>
+      {w.category_scores&&Object.keys(w.category_scores).length>0&&<div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>
+        {Object.entries(w.category_scores).map(([cat,cs])=>
+          <div key={cat} style={{background:cs.tier==="sharp"?"rgba(0,245,160,.1)":"#080e14",border:`1px solid ${cs.tier==="sharp"?"#00f5a040":"#1a2a3a"}`,borderRadius:5,padding:"4px 8px",fontSize:10}}>
+            <span>{CE[cat]||"\ud83d\udcca"} {cat}</span>
+            <span className="mono" style={{marginLeft:6,fontWeight:700,color:cs.tier==="sharp"?"#00f5a0":cs.tier==="average"?"#8a9bb5":"#f54242"}}>{cs.tier.toUpperCase()}</span>
+            <span style={{color:"#3a4a5a",marginLeft:4}}>{cs.markets}m {(cs.win_rate*100).toFixed(0)}%wr</span>
+          </div>)}
+      </div>}
       </div>
       {ld&&<div style={{color:"#3a4a5a",fontSize:12,padding:8}}>Loading...</div>}
       {live&&<>
