@@ -30,24 +30,23 @@ const TC={sharp:"#00f5a0",average:"#8a9bb5",dull:"#f54242"};
 const TL={sharp:"\ud83d\udcca SHARP",average:"\u2696\ufe0f AVG",dull:"\u274c DULL"};
 const CE={sports:"\ud83c\udfc0",politics:"\ud83c\udfdb\ufe0f",other:"\ud83d\udcca",nba:"\ud83c\udfc0",nfl:"\ud83c\udfc8",mlb:"\u26be",nhl:"\ud83c\udfd2",soccer:"\u26bd",ufc:"\ud83e\udd4a"};
 
-function Badge({tier}){
-  const c=TC[tier]||"#5a7a9a";
-  return <span style={{background:c+"1e",color:c,padding:"2px 8px",borderRadius:4,fontSize:10,fontWeight:700,whiteSpace:"nowrap"}}>{TL[tier]||tier}</span>
-}
+function Badge({tier}){const c=TC[tier]||"#5a7a9a";return <span style={{background:c+"1e",color:c,padding:"2px 8px",borderRadius:4,fontSize:10,fontWeight:700,whiteSpace:"nowrap"}}>{TL[tier]||tier}</span>}
+function Stat({value,label,color="#5a7a9a"}){return <div style={{background:"#0a1018",border:"1px solid #1a2a3a",borderRadius:8,padding:"12px 8px",textAlign:"center",minWidth:80}}><div className="mono" style={{fontSize:22,fontWeight:800,color}}>{value}</div><div style={{fontSize:9,color:"#3a4a5a",letterSpacing:1.5,marginTop:4,textTransform:"uppercase"}}>{label}</div></div>}
+function Bar({pct,h=6,o=1}){const w=Math.max(2,Math.round(pct*100));return <div style={{display:"flex",height:h,borderRadius:h/2,overflow:"hidden",background:"#111b26"}}><div style={{width:w+"%",background:`rgba(0,245,160,${o})`,transition:"width .5s"}}/><div style={{width:(100-w)+"%",background:`rgba(245,66,66,${o})`,transition:"width .5s"}}/></div>}
 
-function Stat({value,label,color="#5a7a9a"}){
-  return <div style={{background:"#0a1018",border:"1px solid #1a2a3a",borderRadius:8,padding:"12px 8px",textAlign:"center",minWidth:80}}>
-    <div className="mono" style={{fontSize:22,fontWeight:800,color}}>{value}</div>
-    <div style={{fontSize:9,color:"#3a4a5a",letterSpacing:1.5,marginTop:4,textTransform:"uppercase"}}>{label}</div>
-  </div>
-}
-
-function Bar({pct,h=6,o=1}){
-  const w=Math.max(2,Math.round(pct*100));
-  return <div style={{display:"flex",height:h,borderRadius:h/2,overflow:"hidden",background:"#111b26"}}>
-    <div style={{width:w+"%",background:`rgba(0,245,160,${o})`,transition:"width .5s"}}/>
-    <div style={{width:(100-w)+"%",background:`rgba(245,66,66,${o})`,transition:"width .5s"}}/>
-  </div>
+function whySummary(w){
+  const parts=[];
+  const cs=w.category_scores||{};
+  const sharpCats=Object.entries(cs).filter(([,v])=>v.tier==="sharp");
+  if(sharpCats.length>0){
+    const best=sharpCats.sort((a,b)=>b[1].sharpness-a[1].sharpness)[0];
+    parts.push(`${CE[best[0]]||""} ${best[0]}: ${best[1].markets}m, ${(best[1].win_rate*100).toFixed(0)}%WR`);
+  }
+  if(w.avg_clv>0.1)parts.push(`entry ${(w.avg_clv*100).toFixed(0)}% below close`);
+  else if(w.avg_clv>0)parts.push(`+${(w.avg_clv*100).toFixed(1)}% CLV`);
+  if(w.total_pnl>1000)parts.push(`$${(w.total_pnl/1000).toFixed(1)}K profit`);
+  else if(w.total_pnl>0)parts.push(`$${w.total_pnl.toFixed(0)} profit`);
+  return parts.join(" \u00b7 ")||`${w.distinct_markets} markets, ${(w.win_rate*100).toFixed(0)}%WR`;
 }
 
 function WalletRow({w,rank}){
@@ -56,12 +55,10 @@ function WalletRow({w,rank}){
   const[ld,setLd]=useState(false);
   const c=TC[w.tier]||"#5a7a9a",pc=w.total_pnl>=0?"#00f5a0":"#f54242";
   const ps=w.total_pnl>=0?"+":"",pf=Math.abs(w.total_pnl)>=1e6?`$${(w.total_pnl/1e6).toFixed(1)}M`:`$${Math.abs(w.total_pnl).toLocaleString("en",{maximumFractionDigits:0})}`;
-
   const click=async()=>{
     if(!open&&!live){setLd(true);try{setLive(await(await fetch(`/api/wallets/${w.wallet}/live`)).json())}catch(e){}setLd(false)}
     setOpen(!open)
   };
-
   return <div style={{borderBottom:"1px solid #111b26"}}>
     <div onClick={click} style={{display:"grid",gridTemplateColumns:"36px 1fr 80px 52px 60px 52px 70px",alignItems:"center",padding:"10px 8px",cursor:"pointer"}}
       onMouseEnter={e=>e.currentTarget.style.background="#0d1520"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
@@ -70,7 +67,7 @@ function WalletRow({w,rank}){
         <div style={{fontSize:13,fontWeight:600,color:"#e8edf2",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{w.display_name}</div>
         <div style={{display:"flex",alignItems:"center",gap:6,marginTop:2}}>
           <Badge tier={w.tier}/>
-          <span className="mono" style={{fontSize:10,color:"#2a3a4a"}}>{w.wallet.slice(0,6)}...{w.wallet.slice(-4)}</span>
+          <span style={{fontSize:10,color:"#5a7a9a",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{whySummary(w)}</span>
         </div>
       </div>
       <div className="mono" style={{textAlign:"right",fontSize:18,fontWeight:800,color:c}}>{(w.sharpness_score*100).toFixed(0)}</div>
@@ -121,30 +118,27 @@ function MktCard({m}){
   const dc={YES:{c:"#00f5a0",a:"\u25b2",label:"YES"},NO:{c:"#f54242",a:"\u25bc",label:"NO"},SPLIT:{c:"#5a7a9a",a:"\u25c6",label:"SPLIT"}}[m.smart_direction]||{c:"#5a7a9a",a:"?",label:"?"};
   const totalSharps=m.sharp_yes_count+m.sharp_no_count;
   const gapAbs=Math.abs(gap);
-  // Signal strength: strong if high divergence + big gap + many sharps
   const strong=div>=.3&&gapAbs>=.08&&totalSharps>=3;
   const moderate=div>=.15||gapAbs>=.05||totalSharps>=2;
   const borderColor=strong?"#f5424440":moderate?"#f5c84225":"#1a2a3a";
-
-  return <div style={{background:"#0a1018",border:`1px solid ${borderColor}`,borderRadius:8,padding:14,transition:"border-color .2s"}}>
-    {/* Header: Question + Smart Money Direction */}
+  return <div style={{background:"#0a1018",border:`1px solid ${borderColor}`,borderRadius:8,padding:14}}>
     <div style={{marginBottom:10}}>
-      <div style={{fontSize:13,fontWeight:600,color:"#e8edf2",lineHeight:1.4,marginBottom:6}}>{CE[m.sub_category]||CE[m.category]||"\ud83d\udcca"} {m.sub_category?<span style={{fontSize:10,color:"#5a7a9a",textTransform:"uppercase",marginRight:4}}>{m.sub_category}</span>:null}{m.question?.slice(0,70)}</div>
+      <div style={{fontSize:13,fontWeight:600,color:"#e8edf2",lineHeight:1.4,marginBottom:6}}>
+        {CE[m.sub_category]||CE[m.category]||"\ud83d\udcca"}{m.sub_category?<span style={{fontSize:10,color:"#5a7a9a",textTransform:"uppercase",marginLeft:4,marginRight:4}}>{m.sub_category}</span>:" "}{m.question?.slice(0,70)}
+      </div>
       <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
         <div style={{background:dc.c+"18",color:dc.c,padding:"4px 10px",borderRadius:5,fontSize:14,fontWeight:800,fontFamily:"'JetBrains Mono',monospace"}}>
           {dc.a} Smart Money: {dc.label} {(m.smart_money_yes_pct*100).toFixed(0)}%
         </div>
-        <span style={{fontSize:11,color:"#5a7a9a"}}>Mkt Price: {(m.market_price*100).toFixed(0)}%</span>
+        <span style={{fontSize:11,color:"#5a7a9a"}}>Mkt: {(m.market_price*100).toFixed(0)}%</span>
         {gapAbs>=.05&&<span style={{fontSize:11,color:gapAbs>=.1?"#f5c842":"#a855f7",fontWeight:600}}>
           {gap>0?"\u25b2 Underpriced":"\u25bc Overpriced"} by {(gapAbs*100).toFixed(0)}%
         </span>}
       </div>
     </div>
-
-    {/* Sharp vs Dull bars */}
     <div style={{marginBottom:6}}>
       <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"#5a7a9a",marginBottom:2}}>
-        <span>SHARP ({totalSharps} wallets) &mdash; ${(m.sharp_yes_notional+m.sharp_no_notional).toLocaleString("en",{maximumFractionDigits:0})} total</span>
+        <span>SHARP ({totalSharps} wallets) &mdash; ${(m.sharp_yes_notional+m.sharp_no_notional).toLocaleString("en",{maximumFractionDigits:0})}</span>
         <span style={{color:dc.c}}>{(m.smart_money_yes_pct*100).toFixed(0)}% YES</span></div>
       <Bar pct={m.smart_money_yes_pct} h={7}/>
     </div>
@@ -154,14 +148,54 @@ function MktCard({m}){
         <span>{(m.dull_money_yes_pct*100).toFixed(0)}% YES</span></div>
       <Bar pct={m.dull_money_yes_pct} h={5} o={.4}/>
     </div>
-
-    {/* Bottom signal badges */}
     <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
       {div>=.3&&<span style={{background:"rgba(245,66,66,.15)",color:"#f54242",padding:"2px 8px",borderRadius:4,fontSize:10,fontWeight:700}}>{"\u26a1"} Sharp &amp; Dull Disagree ({(div*100).toFixed(0)}%)</span>}
       {div>=.15&&div<.3&&<span style={{background:"rgba(245,200,66,.1)",color:"#f5c842",padding:"2px 8px",borderRadius:4,fontSize:10,fontWeight:600}}>Mild Divergence ({(div*100).toFixed(0)}%)</span>}
       {strong&&<span style={{background:"rgba(168,85,247,.15)",color:"#a855f7",padding:"2px 8px",borderRadius:4,fontSize:10,fontWeight:700}}>{"\ud83c\udfaf"} Strong Signal</span>}
       <span style={{fontSize:10,color:"#3a4a5a",marginLeft:"auto"}}>Vol: ${m.volume?.toLocaleString("en",{maximumFractionDigits:0})}</span>
     </div>
+  </div>
+}
+
+function WhaleRow({w}){
+  return <div style={{display:"flex",alignItems:"center",padding:"10px 12px",borderBottom:"1px solid #0d1520",gap:8}}>
+    <div style={{width:6,height:6,borderRadius:3,background:w.is_sharp?"#00f5a0":"#1a2a3a",flexShrink:0}}/>
+    <div style={{flex:1,minWidth:0}}>
+      <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:2}}>
+        <span style={{fontSize:12,fontWeight:600,color:"#e8edf2"}}>{w.display_name}</span>
+        {w.is_sharp&&<span style={{fontSize:9,background:"rgba(0,245,160,.12)",color:"#00f5a0",padding:"1px 6px",borderRadius:3,fontWeight:700}}>SHARP{w.category_detail?` \u00b7 ${w.category_detail.toUpperCase()}`:""}
+        </span>}
+        {!w.is_sharp&&<span style={{fontSize:9,color:"#3a4a5a"}}>{w.tier}</span>}
+      </div>
+      <div style={{fontSize:11,color:"#5a7a9a",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{w.title}</div>
+    </div>
+    <div style={{textAlign:"right",flexShrink:0}}>
+      <div style={{fontSize:14,fontWeight:800,color:w.outcome==="YES"?"#00f5a0":"#f54242",fontFamily:"'JetBrains Mono',monospace"}}>{w.outcome}</div>
+      <div className="mono" style={{fontSize:11,color:"#f5c842"}}>${(w.notional/1000).toFixed(0)}K @ {(w.avg_price*100).toFixed(0)}&cent;</div>
+    </div>
+  </div>
+}
+
+function CategorySection({cat,label,emoji,wallets}){
+  const[open,setOpen]=useState(false);
+  const catWallets=wallets.filter(w=>{const cs=w.category_scores||{};return cs[cat]&&cs[cat].tier==="sharp"})
+    .sort((a,b)=>(b.category_scores[cat]?.sharpness||0)-(a.category_scores[cat]?.sharpness||0));
+  if(catWallets.length===0)return null;
+  return <div style={{background:"#0a1018",border:"1px solid #1a2a3a",borderRadius:8,overflow:"hidden",marginBottom:8}}>
+    <div onClick={()=>setOpen(!open)} style={{padding:"12px 14px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+      <div style={{display:"flex",alignItems:"center",gap:8}}>
+        <span style={{fontSize:18}}>{emoji}</span>
+        <span style={{fontSize:13,fontWeight:700,color:"#e8edf2"}}>{label}</span>
+        <span className="mono" style={{fontSize:11,color:"#00f5a0",background:"rgba(0,245,160,.1)",padding:"2px 8px",borderRadius:4}}>{catWallets.length} sharp</span>
+      </div>
+      <span style={{color:"#3a4a5a",fontSize:12}}>{open?"\u25b2":"\u25bc"}</span>
+    </div>
+    {open&&<div style={{borderTop:"1px solid #111b26"}}>
+      <div style={{display:"grid",gridTemplateColumns:"36px 1fr 80px 52px 60px 52px 70px",padding:"6px 10px",borderBottom:"1px solid #111b26"}}>
+        {["#","Wallet","Score","CLV","WR","Mkts","PnL"].map((h,i)=><span key={i} style={{fontSize:8,fontWeight:700,color:"#2a3a4a",letterSpacing:1,textTransform:"uppercase",textAlign:i>1?"right":"left"}}>{h}</span>)}</div>
+      {catWallets.map((w,i)=>{const cs=w.category_scores[cat];
+        return <WalletRow key={w.wallet} w={{...w,sharpness_score:cs.sharpness,win_rate:cs.win_rate,total_pnl:cs.pnl,distinct_markets:cs.markets,avg_clv:cs.avg_clv}} rank={i+1}/>})}
+    </div>}
   </div>
 }
 
@@ -173,7 +207,9 @@ function App(){
   const wD=useApi("/api/wallets?limit=200",60000);
   const cD=useApi("/api/convergence",60000);
   const mD=useApi("/api/markets?limit=50",60000);
+  const whaleD=useApi("/api/whales?min_notional=25000",120000);
   const wallets=wD?.wallets||[],signals=cD?.signals||[],markets=mD?.markets||[];
+  const whales=whaleD?.whales||[];
   const tiers=stats?.tiers||{};
   const fw=wF==="all"?wallets:wallets.filter(w=>w.tier===wF);
   const sk={sharpness:"sharpness_score",pnl:"total_pnl",clv:"avg_clv",winrate:"win_rate",markets:"distinct_markets"};
@@ -181,7 +217,6 @@ function App(){
 
   const Btn=({id,label})=><button onClick={()=>setTab(id)} style={{background:tab===id?"#1a2a3a":"transparent",color:tab===id?"#e8edf2":"#5a7a9a",border:`1px solid ${tab===id?"#2a3a4a":"transparent"}`,borderRadius:6,padding:"6px 14px",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}}>{label}</button>;
   const FB=({v,l,set,cur})=><button onClick={()=>set(v)} style={{background:cur===v?"#1a2a3a":"transparent",color:cur===v?"#e8edf2":"#5a7a9a",border:`1px solid ${cur===v?"#2a3a4a":"transparent"}`,borderRadius:4,padding:"3px 8px",fontSize:10,cursor:"pointer",fontFamily:"'DM Sans',sans-serif",textTransform:"uppercase"}}>{l}</button>;
-
   const WH=<div style={{display:"grid",gridTemplateColumns:"36px 1fr 80px 52px 60px 52px 70px",padding:"8px",borderBottom:"2px solid #1a2a3a"}}>
     {["#","Wallet","Score","CLV","Win%","Mkts","PnL"].map((h,i)=><span key={i} style={{fontSize:9,fontWeight:700,color:"#3a4a5a",letterSpacing:1.5,textTransform:"uppercase",textAlign:i>1?"right":"left"}}>{h}</span>)}</div>;
 
@@ -202,7 +237,7 @@ function App(){
     <div style={{display:"flex",gap:4,marginBottom:16}}>
       <Btn id="dashboard" label="Dashboard"/>
       <Btn id="markets" label={`Markets${markets.length?` (${markets.length})`:""}`}/>
-      <Btn id="wallets" label={`Wallets${wallets.length?` (${wallets.length})`:""}`}/>
+      <Btn id="wallets" label="Leaderboard"/>
     </div>
 
     {tab==="dashboard"&&<div style={{animation:"fadeIn .2s ease"}}>
@@ -210,47 +245,67 @@ function App(){
         <Stat value={stats?.wallets_scored||0} label="Wallets"/>
         <Stat value={tiers.sharp||0} label="Sharp" color="#00f5a0"/>
         <Stat value={signals.length} label="Convergence" color="#a855f7"/>
-        <Stat value={markets.length} label="Mkts Tracked" color="#f5c842"/>
+        <Stat value={markets.length} label="Mkts Intel" color="#f5c842"/>
         <Stat value={stats?.markets_analyzed||0} label="Analyzed" color="#5a7a9a"/>
       </div>
-      {signals.length>0&&<div style={{marginBottom:20}}>
+
+      {/* Whale Trades */}
+      <div style={{marginBottom:24}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+          <h2 style={{fontSize:13,fontWeight:700,color:"#f5c842",letterSpacing:1}}>{"\ud83d\udc0b"} WHALE TRADES</h2>
+          <span style={{fontSize:10,color:"#3a4a5a"}}>$25K+ positions{whaleD?` \u00b7 ${whaleD.sharp_whales||0} from sharp wallets`:""}</span>
+        </div>
+        <div style={{background:"#0a1018",border:"1px solid #1a2a3a",borderRadius:8,overflow:"hidden"}}>
+          {whales.length>0?whales.slice(0,10).map((w,i)=><WhaleRow key={i} w={w}/>):
+            <div style={{padding:20,textAlign:"center",color:"#3a4a5a",fontSize:12}}>Loading whale positions...</div>}
+        </div>
+      </div>
+
+      {signals.length>0&&<div style={{marginBottom:24}}>
         <h2 style={{fontSize:13,fontWeight:700,color:"#a855f7",marginBottom:8,letterSpacing:1}}>{"\ud83c\udfaf"} CONVERGENCE SIGNALS</h2>
         {signals.slice(0,5).map((s,i)=><div key={i} style={{background:"#0a1018",border:"1px solid #1a2a3a",borderRadius:6,padding:12,marginBottom:6,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
           <div style={{flex:1}}><div style={{fontSize:13,color:"#e8edf2",fontWeight:600}}>{s.market_title?.slice(0,60)}</div>
             <div style={{fontSize:10,color:"#3a4a5a",marginTop:2}}>{s.wallet_count} sharp wallets &middot; Strength: {s.strength?.toFixed(2)}</div></div>
           <div style={{fontWeight:800,fontSize:16,color:s.side==="YES"?"#00f5a0":"#f54242"}}>{s.side}</div></div>)}
       </div>}
-      <div style={{marginBottom:20}}>
+
+      <div style={{marginBottom:24}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
-          <h2 style={{fontSize:13,fontWeight:700,color:"#f5c842",letterSpacing:1}}>{"\ud83d\udcca"} HOT MARKETS</h2>
+          <h2 style={{fontSize:13,fontWeight:700,color:"#a855f7",letterSpacing:1}}>{"\ud83d\udca1"} MARKET SIGNALS</h2>
           <button onClick={()=>setTab("markets")} style={{background:"none",border:"none",color:"#a855f7",fontSize:11,cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}}>View all &rarr;</button>
         </div>
         <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(300px,1fr))",gap:8}}>
-          {markets.slice(0,6).map((m,i)=><MktCard key={i} m={m}/>)}
+          {markets.slice(0,4).map((m,i)=><MktCard key={i} m={m}/>)}
         </div>
         {!markets.length&&<div style={{background:"#0a1018",border:"1px solid #1a2a3a",borderRadius:8,padding:20,textAlign:"center",color:"#3a4a5a",fontSize:12}}>Market intel appears after pipeline run</div>}
-      </div>
-      <div>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
-          <h2 style={{fontSize:13,fontWeight:700,color:"#00d4ff",letterSpacing:1}}>{"\ud83d\udc5b"} TOP WALLETS</h2>
-          <button onClick={()=>setTab("wallets")} style={{background:"none",border:"none",color:"#a855f7",fontSize:11,cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}}>View all &rarr;</button>
-        </div>
-        <div style={{background:"#0a1018",border:"1px solid #1a2a3a",borderRadius:8,overflow:"hidden"}}>
-          {WH}{wallets.slice(0,15).map((w,i)=><WalletRow key={w.wallet} w={w} rank={i+1}/>)}
-        </div>
       </div>
     </div>}
 
     {tab==="markets"&&<div style={{animation:"fadeIn .2s ease"}}>
       <div style={{background:"#0a1018",border:"1px solid #1a2a3a",borderRadius:8,padding:12,marginBottom:16,fontSize:11,color:"#5a7a9a",lineHeight:1.6}}>
-        <b style={{color:"#e8edf2"}}>How to read:</b> <span style={{color:"#00f5a0"}}>Green</span> = sharp money YES, <span style={{color:"#f54242"}}>red</span> = NO. <b>Price Gap</b> = market vs smart money. <b style={{color:"#f54242"}}>Divergence</b> = sharp &amp; dull disagree.</div>
+        <b style={{color:"#e8edf2"}}>How to read:</b> <span style={{color:"#00f5a0"}}>Green</span> = sharp money YES, <span style={{color:"#f54242"}}>red</span> = NO. <b>Price Gap</b> = market vs smart money. <b style={{color:"#f54242"}}>Divergence</b> = sharp &amp; dull disagree. Min 3 sharp wallets per card.</div>
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(340px,1fr))",gap:10}}>
         {markets.map((m,i)=><MktCard key={i} m={m}/>)}
       </div>
-      {!markets.length&&<div style={{textAlign:"center",color:"#3a4a5a",padding:40}}>No market intel yet.</div>}
+      {!markets.length&&<div style={{textAlign:"center",color:"#3a4a5a",padding:40}}>No market intel yet — need 3+ sharp wallets per market.</div>}
     </div>}
 
     {tab==="wallets"&&<div style={{animation:"fadeIn .2s ease"}}>
+      <div style={{marginBottom:24}}>
+        <h2 style={{fontSize:13,fontWeight:700,color:"#00d4ff",letterSpacing:1,marginBottom:10}}>{"\ud83c\udfc6"} CATEGORY LEADERBOARDS</h2>
+        <div style={{fontSize:11,color:"#5a7a9a",marginBottom:12}}>Wallets scored per category/sport. 8+ markets to qualify. Click to expand and view trades.</div>
+        <CategorySection cat="nba" label="NBA" emoji={"\ud83c\udfc0"} wallets={wallets}/>
+        <CategorySection cat="nfl" label="NFL" emoji={"\ud83c\udfc8"} wallets={wallets}/>
+        <CategorySection cat="mlb" label="MLB" emoji={"\u26be"} wallets={wallets}/>
+        <CategorySection cat="nhl" label="NHL" emoji={"\ud83c\udfd2"} wallets={wallets}/>
+        <CategorySection cat="soccer" label="Soccer" emoji={"\u26bd"} wallets={wallets}/>
+        <CategorySection cat="ufc" label="UFC / MMA" emoji={"\ud83e\udd4a"} wallets={wallets}/>
+        <CategorySection cat="sports" label="All Sports" emoji={"\ud83c\udfc0"} wallets={wallets}/>
+        <CategorySection cat="politics" label="Politics" emoji={"\ud83c\udfdb\ufe0f"} wallets={wallets}/>
+        <CategorySection cat="other" label="Other" emoji={"\ud83d\udcca"} wallets={wallets}/>
+      </div>
+
+      <h2 style={{fontSize:13,fontWeight:700,color:"#00d4ff",letterSpacing:1,marginBottom:10}}>{"\ud83d\udc5b"} ALL WALLETS</h2>
       <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap",alignItems:"center"}}>
         <span style={{fontSize:10,color:"#3a4a5a",marginRight:4}}>TIER:</span>
         <FB v="all" l={`All (${wallets.length})`} set={setWF} cur={wF}/>
@@ -265,7 +320,7 @@ function App(){
     </div>}
 
     <div style={{marginTop:30,padding:16,textAlign:"center",fontSize:10,color:"#1a2a3a",borderTop:"1px solid #111b26"}}>
-      SharpFlow v1.6 &middot; Not financial advice</div>
+      SharpFlow v2.2 &middot; Not financial advice</div>
   </div>
 }
 ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
