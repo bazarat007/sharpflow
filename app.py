@@ -713,6 +713,7 @@ state = {
     "scored_wallets": [],
     "convergence_signals": [],
     "market_intelligence": [],
+    "whale_positions": [],
     "markets_analyzed": 0,
     "trades_analyzed": 0,
     "wallets_scanned": 0,
@@ -1629,6 +1630,10 @@ def compute_market_intelligence(scored_wallets):
     sharp_wallets_list = wallets_to_scan + cat_sharp_wallets
     scan_list = sharp_wallets_list + dull_wallets
 
+    # Also collect whale positions during this scan
+    whale_positions = []
+    WHALE_MIN_NOTIONAL = 25000
+
     scanned = 0
     for wdata in scan_list:
         wallet_addr = wdata["wallet"]
@@ -1676,14 +1681,28 @@ def compute_market_intelligence(scored_wallets):
                         market_positions[cid]["sharp_no"].append(entry)
                 elif tier == "dull":
                     if is_yes:
-                        market_positions[cid]["sharp_yes"].append(entry)
-                    else:
-                        market_positions[cid]["sharp_no"].append(entry)
-                elif tier == "dull":
-                    if is_yes:
                         market_positions[cid]["dull_yes"].append(entry)
                     else:
                         market_positions[cid]["dull_no"].append(entry)
+
+                # Collect whale positions
+                if notional >= WHALE_MIN_NOTIONAL:
+                    mkt = active_markets[cid]
+                    whale_positions.append({
+                        "wallet": wallet_addr,
+                        "display_name": wdata["display_name"],
+                        "tier": tier,
+                        "sharpness_score": wdata["sharpness_score"],
+                        "is_sharp": is_cat_sharp,
+                        "is_category_sharp": is_cat_sharp and tier != "sharp",
+                        "category_detail": mkt_sub or mkt_category,
+                        "outcome": outcome.upper() if outcome in ("yes", "y", "1") else "NO",
+                        "title": mkt["question"][:80],
+                        "condition_id": cid,
+                        "notional": round(notional, 2),
+                        "size": round(size, 2),
+                        "avg_price": round(avg_price, 4),
+                    })
 
             scanned += 1
             if scanned % 10 == 0:
@@ -1715,9 +1734,9 @@ def compute_market_intelligence(scored_wallets):
         dy = dedup(pos["dull_yes"])
         dn = dedup(pos["dull_no"])
 
-        # Need at least 3 sharp wallets (overall or category-specific) to be actionable
+        # Need at least 2 sharp wallets (overall or category-specific) to be actionable
         total_sharp = len(sy) + len(sn)
-        if total_sharp < 3:
+        if total_sharp < 2:
             continue
 
         # Compute weighted scores (sharpness-weighted capital)
@@ -1815,8 +1834,12 @@ def compute_market_intelligence(scored_wallets):
     # Sort by interest score (most interesting markets first)
     intel_results.sort(key=lambda m: m["interest_score"], reverse=True)
 
+    # Sort whale positions by notional
+    whale_positions.sort(key=lambda w: w["notional"], reverse=True)
+
     logger.info(f"Market intelligence: {len(intel_results)} markets with sharp wallet activity")
-    return intel_results
+    logger.info(f"Whale positions: {len(whale_positions)} positions >= ${WHALE_MIN_NOTIONAL}, {sum(1 for w in whale_positions if w['is_sharp'])} from sharp wallets")
+    return intel_results, whale_positions
 
 
 # ================================================================
@@ -2222,9 +2245,10 @@ def run_pipeline():
         signals = detect_convergence(scored, trades)
         state["convergence_signals"] = signals
 
-        # Step 5: Compute market intelligence
-        intel = compute_market_intelligence(scored)
+        # Step 5: Compute market intelligence (also collects whale positions)
+        intel, whale_positions = compute_market_intelligence(scored)
         state["market_intelligence"] = intel
+        state["whale_positions"] = whale_positions
 
         elapsed = time.time() - start
         state["status"] = "ready"
@@ -2453,127 +2477,15 @@ def get_convergence(min_strength: float = Query(0.0)):
 def get_whale_positions(min_notional: float = Query(25000)):
     """
     Surface the largest positions on active markets.
-    Tags positions from sharp wallets.
+    Data is cached during pipeline run — returns instantly.
     """
-    scored = state.get("scored_wallets", [])
-    if not scored:
-        return {"whales": [], "total": 0}
-
-    wallet_lookup = {w["wallet"]: w for w in scored}
-
-    # Scan top wallets by total invested (most active) — limit to keep it fast
-    scan_wallets = sorted(scored, key=lambda w: w.get("total_invested", 0), reverse=True)[:300]
-
-    whale_positions = []
-    scanned = 0
-    for wdata in scan_wallets:
-        try:
-            positions = api_get(f"{DATA_API}/positions", {"user": wdata["wallet"], "sizeThreshold": 10})
-            if not positions or not isinstance(positions, list):
-                continue
-            scanned += 1
-
-            for pos in positions:
-                size = float(pos.get("size", 0) or 0)
-                avg_price = float(pos.get("avgPrice", 0) or 0)
-                notional = size * avg_price
-                if notional < min_notional:
-                    continue
-
-                outcome = (pos.get("outcome", "") or "").upper()
-                title = pos.get("title", "") or pos.get("eventTitle", "Unknown market")
-                cid = pos.get("conditionId") or pos.get("market") or ""
-
-                # Check category-specific sharpness
-                mkt_cat = None
-                cat_sharp = False
-                for m in state.get("market_intelligence", []):
-                    if m["condition_id"] == cid:
-                        mkt_cat = m.get("category")
-                        break
-                if mkt_cat:
-                    cat_sharp = wdata.get("category_scores", {}).get(mkt_cat, {}).get("tier") == "sharp"
-
-                whale_positions.append({
-                    "wallet": wdata["wallet"],
-                    "display_name": wdata["display_name"],
-                    "tier": wdata["tier"],
-                    "sharpness_score": wdata["sharpness_score"],
-                    "is_sharp": wdata["tier"] == "sharp" or cat_sharp,
-                    "is_category_sharp": cat_sharp,
-                    "category_detail": mkt_cat,
-                    "outcome": outcome,
-                    "title": title[:80],
-                    "condition_id": cid,
-                    "notional": round(notional, 2),
-                    "size": round(size, 2),
-                    "avg_price": round(avg_price, 4),
-                })
-
-        except Exception as e:
-            logger.debug(f"Whale scan failed for {wdata['wallet'][:10]}: {e}")
-
-    whale_positions.sort(key=lambda w: w["notional"], reverse=True)
-
+    whales = state.get("whale_positions", [])
+    filtered = [w for w in whales if w["notional"] >= min_notional]
     return {
-        "whales": whale_positions[:50],
-        "total": len(whale_positions),
-        "wallets_scanned": scanned,
+        "whales": filtered[:50],
+        "total": len(filtered),
         "min_notional": min_notional,
-        "sharp_whales": sum(1 for w in whale_positions if w["is_sharp"]),
-    }
-
-
-@app.get("/api/whale-stats")
-def get_whale_stats():
-    """Quick position size distribution from current scored wallets — helps calibrate whale threshold."""
-    scored = state.get("scored_wallets", [])
-    if not scored:
-        return {"error": "No scored wallets yet"}
-
-    # Sample top 200 wallets by investment size
-    sample = sorted(scored, key=lambda w: w.get("total_invested", 0), reverse=True)[:200]
-
-    all_notionals = []
-    scanned = 0
-    for wdata in sample:
-        try:
-            positions = api_get(f"{DATA_API}/positions", {"user": wdata["wallet"], "sizeThreshold": 1})
-            if not positions or not isinstance(positions, list):
-                continue
-            scanned += 1
-            for pos in positions:
-                size = float(pos.get("size", 0) or 0)
-                avg_price = float(pos.get("avgPrice", 0) or 0)
-                notional = size * avg_price
-                if notional >= 100:
-                    all_notionals.append(notional)
-        except:
-            pass
-        if scanned >= 50:  # Quick sample, don't scan too many
-            break
-
-    if not all_notionals:
-        return {"error": "No positions found"}
-
-    all_notionals.sort()
-    n = len(all_notionals)
-
-    return {
-        "sample_wallets": scanned,
-        "total_positions": n,
-        "median": round(all_notionals[n // 2], 0),
-        "p75": round(all_notionals[int(n * 0.75)], 0),
-        "p90": round(all_notionals[int(n * 0.90)], 0),
-        "p95": round(all_notionals[int(n * 0.95)], 0),
-        "p99": round(all_notionals[int(n * 0.99)], 0),
-        "max": round(all_notionals[-1], 0),
-        "over_1k": sum(1 for x in all_notionals if x >= 1000),
-        "over_5k": sum(1 for x in all_notionals if x >= 5000),
-        "over_10k": sum(1 for x in all_notionals if x >= 10000),
-        "over_25k": sum(1 for x in all_notionals if x >= 25000),
-        "over_50k": sum(1 for x in all_notionals if x >= 50000),
-        "over_100k": sum(1 for x in all_notionals if x >= 100000),
+        "sharp_whales": sum(1 for w in filtered if w["is_sharp"]),
     }
 
 
