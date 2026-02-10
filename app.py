@@ -484,8 +484,19 @@ def db_get_all_trades(months_back=6):
         rows = cur.fetchall()
         cur.close()
         conn.close()
-        logger.info(f"  DB query returned {len(rows):,} trades (last {months_back} months)")
-        return [dict(r) for r in rows]
+        trades = [dict(r) for r in rows]
+
+        # Derive sub-category from title for sports trades
+        for t in trades:
+            if t.get("category") == "sports" and t.get("title"):
+                title_lower = t["title"].lower()
+                for sport, keywords in SPORT_SUBCATS.items():
+                    if any(kw in title_lower for kw in keywords):
+                        t["sub_category"] = sport
+                        break
+
+        logger.info(f"  DB query returned {len(trades):,} trades (last {months_back} months)")
+        return trades
     except Exception as e:
         logger.error(f"DB load trades error: {e}")
         return []
@@ -1032,11 +1043,21 @@ def score_all_wallets(trades, markets_lookup):
 
         # Category-specific scoring
         # Group trades by category AND sub-category, score each independently
+        # Re-derive sub-category from title since DB trades may lack it
         cat_trades = defaultdict(list)
         subcat_trades = defaultdict(list)
         for t in wtrades:
-            cat_trades[t.get("category", "other")].append(t)
+            cat = t.get("category", "other")
+            cat_trades[cat].append(t)
+
+            # Derive sub-category from title if not already set
             sc = t.get("sub_category")
+            if not sc and cat == "sports":
+                title = (t.get("title") or "").lower()
+                for sport, keywords in SPORT_SUBCATS.items():
+                    if any(kw in title for kw in keywords):
+                        sc = sport
+                        break
             if sc:
                 subcat_trades[sc].append(t)
 
