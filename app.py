@@ -84,6 +84,42 @@ POLITICS_KW = ["politics","election","president","congress","senate","governor",
                "ban","mandate","regulation","deregulat","executive action",
                "pardon","indictment","arraign","conviction","verdict"]
 
+# Sport-specific sub-category keywords
+SPORT_SUBCATS = {
+    "nba": ["nba", "basketball", "lakers", "celtics", "warriors", "bucks", "nuggets",
+            "76ers", "knicks", "nets", "heat", "bulls", "suns", "mavs", "mavericks",
+            "cavaliers", "cavs", "thunder", "grizzlies", "timberwolves", "clippers",
+            "rockets", "spurs", "pelicans", "kings", "pacers", "hawks", "hornets",
+            "pistons", "wizards", "blazers", "jazz", "raptors", "magic",
+            "rebounds", "assists", "triple double", "all-star", "dunk contest"],
+    "nfl": ["nfl", "super bowl", "touchdown", "quarterback", "chiefs", "eagles",
+            "49ers", "cowboys", "ravens", "bills", "dolphins", "jets", "patriots",
+            "steelers", "bengals", "browns", "texans", "colts", "jaguars", "titans",
+            "broncos", "raiders", "chargers", "seahawks", "rams", "cardinals",
+            "commanders", "giants", "bears", "packers", "lions", "vikings", "saints",
+            "buccaneers", "bucs", "falcons", "panthers", "rushing yards",
+            "passing yards", "field goal"],
+    "mlb": ["mlb", "baseball", "world series", "home run", "batting", "pitcher",
+            "yankees", "dodgers", "astros", "braves", "mets", "phillies", "padres",
+            "cubs", "red sox", "mariners", "twins", "guardians", "orioles", "rangers",
+            "blue jays", "brewers", "diamondbacks", "reds", "pirates", "royals",
+            "tigers", "rockies", "marlins", "nationals", "white sox", "athletics",
+            "strikeout", "rbi", "inning"],
+    "nhl": ["nhl", "hockey", "stanley cup", "hat trick", "goalie",
+            "bruins", "maple leafs", "canadiens", "oilers", "avalanche",
+            "penguins", "lightning", "hurricanes", "stars", "wild", "jets",
+            "flames", "canucks", "kraken", "predators", "islanders", "devils",
+            "red wings", "blues", "sharks", "blackhawks", "capitals", "flyers"],
+    "soccer": ["soccer", "premier league", "champions league", "la liga", "serie a",
+               "bundesliga", "ligue 1", "mls", "world cup", "euros", "copa america",
+               "europa league", "liverpool", "manchester united", "manchester city",
+               "arsenal", "chelsea", "tottenham", "barcelona", "real madrid",
+               "bayern", "psg", "juventus", "inter milan", "ac milan", "dortmund"],
+    "ufc": ["ufc", "mma", "boxing", "fight", "knockout", "submission",
+            "featherweight", "lightweight", "welterweight", "middleweight",
+            "heavyweight", "bantamweight", "flyweight", "dana white", "octagon"],
+}
+
 # Telegram (optional)
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -475,7 +511,7 @@ def db_save_markets(markets_list):
         end_date = m.get("endDate") or m.get("end_date_iso") or None
 
         rows.append((
-            cid, question, categorize(question, "") if question else "other",
+            cid, question, categorize(question, "")[0] if question else "other",
             slug, volume, resolved, winning, end_date,
         ))
 
@@ -701,14 +737,24 @@ def api_get(url, params=None, retries=3):
 
 
 def categorize(question, tags_str):
-    """Categorize a market as sports, politics, or other."""
+    """Categorize a market as sports/politics/other with optional sport sub-category."""
     q = question.lower()
     t = tags_str.lower()
-    if any(kw in q or kw in t for kw in SPORTS_KW):
-        return "sports"
-    if any(kw in q or kw in t for kw in POLITICS_KW):
-        return "politics"
-    return "other"
+    combined = q + " " + t
+
+    if any(kw in combined for kw in SPORTS_KW):
+        # Try to identify specific sport
+        sub = None
+        for sport, keywords in SPORT_SUBCATS.items():
+            if any(kw in combined for kw in keywords):
+                sub = sport
+                break
+        return ("sports", sub)
+
+    if any(kw in combined for kw in POLITICS_KW):
+        return ("politics", None)
+
+    return ("other", None)
 
 
 def fetch_resolved_markets(limit=MARKETS_TO_FETCH):
@@ -769,7 +815,7 @@ def fetch_resolved_markets(limit=MARKETS_TO_FETCH):
                 if res:
                     winning = str(res).lower()
 
-            cat = categorize(m.get("question", ""), " ".join(tags))
+            cat, sub_cat = categorize(m.get("question", ""), " ".join(tags))
 
             all_markets.append({
                 "condition_id": cid,
@@ -777,6 +823,7 @@ def fetch_resolved_markets(limit=MARKETS_TO_FETCH):
                 "slug": m.get("slug", ""),
                 "volume": vol,
                 "category": cat,
+                "sub_category": sub_cat,
                 "winning_outcome": winning,
                 "tokens": tokens,
                 "resolved": True,
@@ -842,6 +889,7 @@ def fetch_trades_for_markets(markets):
                     "name": t.get("name", ""),
                     "pseudonym": t.get("pseudonym", ""),
                     "category": mkt["category"],
+                    "sub_category": mkt.get("sub_category"),
                     "winning_outcome": mkt["winning_outcome"],
                 })
 
@@ -983,15 +1031,22 @@ def score_all_wallets(trades, markets_lookup):
         name = sample.get("pseudonym") or sample.get("name") or wallet[:12] + "..."
 
         # Category-specific scoring
-        # Group trades by category and score each independently
+        # Group trades by category AND sub-category, score each independently
         cat_trades = defaultdict(list)
+        subcat_trades = defaultdict(list)
         for t in wtrades:
             cat_trades[t.get("category", "other")].append(t)
+            sc = t.get("sub_category")
+            if sc:
+                subcat_trades[sc].append(t)
 
         category_scores = {}
-        CAT_MIN_MARKETS = 8  # Lower threshold per category
+        CAT_MIN_MARKETS = 8  # Minimum markets per category/sub-category
 
-        for cat, ctrades in cat_trades.items():
+        # Score both categories and sub-categories in one pass
+        all_cat_groups = list(cat_trades.items()) + list(subcat_trades.items())
+
+        for cat, ctrades in all_cat_groups:
             cat_market_groups = defaultdict(list)
             for t in ctrades:
                 cat_market_groups[t["condition_id"]].append(t)
@@ -1457,12 +1512,14 @@ def compute_market_intelligence(scored_wallets):
     wallet_lookup = {w["wallet"]: w for w in scored_wallets}
 
     # For category-specific sharp detection
-    def is_sharp_for_category(wallet_data, category):
-        """Check if wallet is sharp overall OR sharp in this specific category."""
+    def is_sharp_for_category(wallet_data, category, sub_category=None):
+        """Check if wallet is sharp overall, for the category, or for the sub-category."""
         if wallet_data["tier"] == "sharp":
             return True
         cat_scores = wallet_data.get("category_scores", {})
         if category in cat_scores and cat_scores[category]["tier"] == "sharp":
+            return True
+        if sub_category and sub_category in cat_scores and cat_scores[sub_category]["tier"] == "sharp":
             return True
         return False
 
@@ -1507,16 +1564,19 @@ def compute_market_intelligence(scored_wallets):
                             yes_price = tp
 
             q = m.get("question", "")
+            tags_str = " ".join(
+                t.get("label", "") if isinstance(t, dict) else str(t)
+                for t in (m.get("tags") or [])
+            )
+            mkt_cat, mkt_sub = categorize(q, tags_str)
             open_markets[cid] = {
                 "condition_id": cid,
                 "question": q,
                 "slug": m.get("slug", ""),
                 "volume": vol,
                 "yes_price": yes_price,
-                "category": categorize(q, " ".join(
-                    t.get("label", "") if isinstance(t, dict) else str(t)
-                    for t in (m.get("tags") or [])
-                )),
+                "category": mkt_cat,
+                "sub_category": mkt_sub,
                 "end_date": m.get("endDate", ""),
             }
         offset += 100
@@ -1569,9 +1629,10 @@ def compute_market_intelligence(scored_wallets):
 
                 outcome = (pos.get("outcome", "") or "").lower()
                 tier = wdata["tier"]
-                # Check category-specific sharpness for this market's category
+                # Check category-specific sharpness for this market's category and sub-category
                 mkt_category = active_markets[cid].get("category", "other")
-                is_cat_sharp = is_sharp_for_category(wdata, mkt_category)
+                mkt_sub = active_markets[cid].get("sub_category")
+                is_cat_sharp = is_sharp_for_category(wdata, mkt_category, mkt_sub)
 
                 entry = {
                     "wallet": wallet_addr,
@@ -1699,6 +1760,7 @@ def compute_market_intelligence(scored_wallets):
             "question": mkt["question"],
             "slug": mkt["slug"],
             "category": mkt["category"],
+            "sub_category": mkt.get("sub_category"),
             "volume": mkt["volume"],
             "market_price": round(market_price, 3),
 
@@ -1897,7 +1959,7 @@ def alert_convergence(signals):
             f"{emoji} <b>CONVERGENCE SIGNAL</b>\n\n"
             f"📊 <b>{s['market_title'][:70]}</b>\n"
             f"📍 Direction: <b>{s['side']}</b>\n"
-            f"👛 {s['wallet_count']} sharp wallets ({s['elite_count']}⚡ elite)\n"
+            f"\U0001f45b {s['wallet_count']} sharp wallets\n"
             f"💪 Strength: {s['strength']:.2f}\n"
             f"💰 Combined: ${s.get('total_notional', 0):,.0f}\n"
             f"📈 Market price: {s.get('market_price', 0):.0%}\n\n"
@@ -2366,6 +2428,134 @@ def get_convergence(min_strength: float = Query(0.0)):
     return {"signals": signals, "total": len(signals)}
 
 
+@app.get("/api/whales")
+def get_whale_positions(min_notional: float = Query(25000)):
+    """
+    Surface the largest positions on active markets.
+    Tags positions from sharp wallets.
+    """
+    scored = state.get("scored_wallets", [])
+    if not scored:
+        return {"whales": [], "total": 0}
+
+    wallet_lookup = {w["wallet"]: w for w in scored}
+
+    # Scan top wallets by total invested (most active) — limit to keep it fast
+    scan_wallets = sorted(scored, key=lambda w: w.get("total_invested", 0), reverse=True)[:300]
+
+    whale_positions = []
+    scanned = 0
+    for wdata in scan_wallets:
+        try:
+            positions = api_get(f"{DATA_API}/positions", {"user": wdata["wallet"], "sizeThreshold": 10})
+            if not positions or not isinstance(positions, list):
+                continue
+            scanned += 1
+
+            for pos in positions:
+                size = float(pos.get("size", 0) or 0)
+                avg_price = float(pos.get("avgPrice", 0) or 0)
+                notional = size * avg_price
+                if notional < min_notional:
+                    continue
+
+                outcome = (pos.get("outcome", "") or "").upper()
+                title = pos.get("title", "") or pos.get("eventTitle", "Unknown market")
+                cid = pos.get("conditionId") or pos.get("market") or ""
+
+                # Check category-specific sharpness
+                mkt_cat = None
+                cat_sharp = False
+                for m in state.get("market_intelligence", []):
+                    if m["condition_id"] == cid:
+                        mkt_cat = m.get("category")
+                        break
+                if mkt_cat:
+                    cat_sharp = wdata.get("category_scores", {}).get(mkt_cat, {}).get("tier") == "sharp"
+
+                whale_positions.append({
+                    "wallet": wdata["wallet"],
+                    "display_name": wdata["display_name"],
+                    "tier": wdata["tier"],
+                    "sharpness_score": wdata["sharpness_score"],
+                    "is_sharp": wdata["tier"] == "sharp" or cat_sharp,
+                    "is_category_sharp": cat_sharp,
+                    "category_detail": mkt_cat,
+                    "outcome": outcome,
+                    "title": title[:80],
+                    "condition_id": cid,
+                    "notional": round(notional, 2),
+                    "size": round(size, 2),
+                    "avg_price": round(avg_price, 4),
+                })
+
+        except Exception as e:
+            logger.debug(f"Whale scan failed for {wdata['wallet'][:10]}: {e}")
+
+    whale_positions.sort(key=lambda w: w["notional"], reverse=True)
+
+    return {
+        "whales": whale_positions[:50],
+        "total": len(whale_positions),
+        "wallets_scanned": scanned,
+        "min_notional": min_notional,
+        "sharp_whales": sum(1 for w in whale_positions if w["is_sharp"]),
+    }
+
+
+@app.get("/api/whale-stats")
+def get_whale_stats():
+    """Quick position size distribution from current scored wallets — helps calibrate whale threshold."""
+    scored = state.get("scored_wallets", [])
+    if not scored:
+        return {"error": "No scored wallets yet"}
+
+    # Sample top 200 wallets by investment size
+    sample = sorted(scored, key=lambda w: w.get("total_invested", 0), reverse=True)[:200]
+
+    all_notionals = []
+    scanned = 0
+    for wdata in sample:
+        try:
+            positions = api_get(f"{DATA_API}/positions", {"user": wdata["wallet"], "sizeThreshold": 1})
+            if not positions or not isinstance(positions, list):
+                continue
+            scanned += 1
+            for pos in positions:
+                size = float(pos.get("size", 0) or 0)
+                avg_price = float(pos.get("avgPrice", 0) or 0)
+                notional = size * avg_price
+                if notional >= 100:
+                    all_notionals.append(notional)
+        except:
+            pass
+        if scanned >= 50:  # Quick sample, don't scan too many
+            break
+
+    if not all_notionals:
+        return {"error": "No positions found"}
+
+    all_notionals.sort()
+    n = len(all_notionals)
+
+    return {
+        "sample_wallets": scanned,
+        "total_positions": n,
+        "median": round(all_notionals[n // 2], 0),
+        "p75": round(all_notionals[int(n * 0.75)], 0),
+        "p90": round(all_notionals[int(n * 0.90)], 0),
+        "p95": round(all_notionals[int(n * 0.95)], 0),
+        "p99": round(all_notionals[int(n * 0.99)], 0),
+        "max": round(all_notionals[-1], 0),
+        "over_1k": sum(1 for x in all_notionals if x >= 1000),
+        "over_5k": sum(1 for x in all_notionals if x >= 5000),
+        "over_10k": sum(1 for x in all_notionals if x >= 10000),
+        "over_25k": sum(1 for x in all_notionals if x >= 25000),
+        "over_50k": sum(1 for x in all_notionals if x >= 50000),
+        "over_100k": sum(1 for x in all_notionals if x >= 100000),
+    }
+
+
 @app.get("/api/markets")
 def get_market_intelligence(limit: int = Query(50, ge=1, le=200)):
     """
@@ -2593,7 +2783,7 @@ def run_backfill(max_markets=10000, min_volume=500):
                         if res:
                             winning = str(res).lower()
 
-                    cat = categorize(m.get("question", ""), " ".join(tags))
+                    cat, sub_cat = categorize(m.get("question", ""), " ".join(tags))
 
                     all_markets.append({
                         "condition_id": cid,
