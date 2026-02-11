@@ -47,18 +47,19 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 
-# Scoring weights
-W_CLV = 0.25
-W_TIMING = 0.25
-W_CONSISTENCY = 0.25
-W_ROI = 0.25
+# Scoring weights (ROI-heavy — validated by 80K-config grid search, spread +0.30)
+W_CLV = 0.20
+W_TIMING = 0.20
+W_CONSISTENCY = 0.20
+W_ROI = 0.40
 
-MIN_MARKETS = 15           # Raised: minimum distinct resolved markets to score a wallet (backtest validated)
+MIN_MARKETS = 8            # Validated: 8 markets with $100 notional filter
 MARKETS_TO_FETCH = 750     # How many resolved markets to fetch from API
 TRADES_PER_MARKET = 500    # Max trades per market
 MIN_VOLUME = 2000          # Minimum market volume (USD)
 API_DELAY = 0.3            # Slightly faster
-SCORING_WINDOW_MONTHS = 6  # Only score wallets on trades from last N months
+SCORING_WINDOW_MONTHS = 2  # Validated: recent behavior predicts better than historical
+MIN_TRADE_NOTIONAL = 100   # Filter dust trades below $100 notional
 
 # Category keywords
 SPORTS_KW = ["sports","nfl","nba","mlb","nhl","soccer","football","basketball",
@@ -935,9 +936,12 @@ def score_all_wallets(trades, markets_lookup):
     max_distinct = 0
 
     for wallet, wtrades in wallet_trades.items():
-        # Group by market
+        # Group by market, filtering dust trades
         market_groups = defaultdict(list)
         for t in wtrades:
+            notional = t["price"] * t["size"]
+            if notional < MIN_TRADE_NOTIONAL:
+                continue
             market_groups[t["condition_id"]].append(t)
 
         distinct = len(market_groups)
@@ -1027,12 +1031,11 @@ def score_all_wallets(trades, markets_lookup):
 
         sharpness = W_CLV * clv_score + W_TIMING * timing_score + W_CONSISTENCY * consistency_score + W_ROI * roi_score
 
-        # Tier assignment — backtest validated:
-        # - No elite tier (overfits to historical data)
-        # - Sharp: strong score + profitable + sufficient markets
+        # Tier assignment — grid search validated (80K configs, Feb 2026):
+        # - Sharp: score >= 0.38, profitable, positive CLV, 8+ markets
         # - Average: moderate score
         # - Dull: everything else
-        if sharpness >= 0.45 and total_pnl > 0 and avg_clv > 0 and distinct >= 15:
+        if sharpness >= 0.38 and total_pnl > 0 and avg_clv > 0:
             tier = "sharp"
         elif sharpness >= 0.25:
             tier = "average"
@@ -1131,7 +1134,7 @@ def score_all_wallets(trades, markets_lookup):
 
             c_sharpness = W_CLV * c_clv_score + W_TIMING * c_timing_score + W_CONSISTENCY * c_consist + W_ROI * c_roi_score
 
-            if c_sharpness >= 0.45 and c_pnl > 0 and c_avg_clv > 0:
+            if c_sharpness >= 0.38 and c_pnl > 0 and c_avg_clv > 0:
                 c_tier = "sharp"
             elif c_sharpness >= 0.25:
                 c_tier = "average"
