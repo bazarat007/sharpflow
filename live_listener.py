@@ -435,14 +435,31 @@ class LiveTradeListener:
             self.running = False
             return
 
-        # Check chain connection
-        if not self.w3.is_connected():
-            logger.error("Cannot connect to Polygon RPC")
+        # Check chain connection with retry
+        connected = False
+        for attempt in range(5):
+            try:
+                chain_id = self.w3.eth.chain_id
+                logger.info(f"Connected to chain {chain_id} (Polygon={'yes' if chain_id == 137 else 'NO'})")
+                connected = True
+                break
+            except Exception as e:
+                logger.warning(f"RPC connection attempt {attempt+1}/5 failed: {e}")
+                time.sleep(5)
+
+        if not connected:
+            # Try a raw request as fallback diagnostic
+            try:
+                import requests as req
+                resp = req.post(self.w3.provider.endpoint_uri, json={
+                    "jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1
+                }, timeout=10)
+                logger.error(f"Raw RPC response: {resp.status_code} {resp.text[:200]}")
+            except Exception as e2:
+                logger.error(f"Raw RPC also failed: {e2}")
+            logger.error("Cannot connect to Polygon RPC after 5 attempts")
             self.running = False
             return
-
-        chain_id = self.w3.eth.chain_id
-        logger.info(f"Connected to chain {chain_id} (Polygon={'yes' if chain_id == 137 else 'NO'})")
 
         # Determine starting block
         db_latest = self.db.get_latest_block()
