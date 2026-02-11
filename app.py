@@ -3506,7 +3506,7 @@ ALCHEMY_URL = os.getenv("ALCHEMY_URL", "")
 if ALCHEMY_URL and DATABASE_URL:
     try:
         from live_listener import start_listener, get_listener_status
-        start_listener(DATABASE_URL, ALCHEMY_URL, poll_interval=15)
+        start_listener(DATABASE_URL, ALCHEMY_URL, poll_interval=5)
         logger.info("Live trade listener started")
     except Exception as e:
         logger.error(f"Failed to start live listener: {e}")

@@ -375,7 +375,7 @@ class LiveTradeListener:
     Designed to run as a background thread.
     """
 
-    def __init__(self, alchemy_url, db_url, poll_interval=15, block_chunk=50):
+    def __init__(self, alchemy_url, db_url, poll_interval=5, block_chunk=9):
         self.w3 = Web3(Web3.HTTPProvider(alchemy_url))
         self.alchemy_url = alchemy_url
         self.db = DBWriter(db_url)
@@ -582,9 +582,8 @@ class LiveTradeListener:
                 f"{'CAUGHT UP' if blocks_behind < 50 else f'{blocks_behind} blocks behind'}"
             )
 
-        # Gradually increase chunk size if we're behind
-        if blocks_behind > 500 and self.block_chunk < 500:
-            self.block_chunk = min(500, self.block_chunk * 2)
+        # Don't increase chunk beyond Alchemy free tier limit (10 blocks)
+        # block_chunk stays at 9
 
     def _decode_raw_log(self, log):
         """Decode a raw JSON-RPC log dict into a trade dict."""
