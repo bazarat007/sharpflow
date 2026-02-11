@@ -2361,6 +2361,24 @@ def debug_env():
     }
 
 
+@app.get("/api/live")
+def get_live_status():
+    """Get live trade listener status."""
+    try:
+        from live_listener import get_listener_status
+        status = get_listener_status()
+        # Also get DB stats if listener has a db
+        if ALCHEMY_URL and DATABASE_URL:
+            from live_listener import _listener_instance
+            if _listener_instance:
+                status["db_stats"] = _listener_instance.db.get_stats()
+        return status
+    except ImportError:
+        return {"running": False, "error": "live_listener module not found"}
+    except Exception as e:
+        return {"running": False, "error": str(e)}
+
+
 @app.get("/api/wallets")
 def get_wallets(
     sort: str = Query("sharpness"),
@@ -3482,6 +3500,18 @@ def background_pipeline():
 # Start pipeline in background thread
 pipeline_thread = threading.Thread(target=background_pipeline, daemon=True)
 pipeline_thread.start()
+
+# Start live trade listener if Alchemy URL is configured
+ALCHEMY_URL = os.getenv("ALCHEMY_URL", "")
+if ALCHEMY_URL and DATABASE_URL:
+    try:
+        from live_listener import start_listener, get_listener_status
+        start_listener(DATABASE_URL, ALCHEMY_URL, poll_interval=15)
+        logger.info("Live trade listener started")
+    except Exception as e:
+        logger.error(f"Failed to start live listener: {e}")
+else:
+    logger.info("Live listener disabled (set ALCHEMY_URL to enable)")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
