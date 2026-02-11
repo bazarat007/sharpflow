@@ -375,8 +375,9 @@ class LiveTradeListener:
     Designed to run as a background thread.
     """
 
-    def __init__(self, alchemy_url, db_url, poll_interval=15, block_chunk=100):
+    def __init__(self, alchemy_url, db_url, poll_interval=15, block_chunk=50):
         self.w3 = Web3(Web3.HTTPProvider(alchemy_url))
+        self.alchemy_url = alchemy_url
         self.db = DBWriter(db_url)
         self.mapper = MarketMapper()
         self.poll_interval = poll_interval
@@ -467,10 +468,10 @@ class LiveTradeListener:
             start_block = db_latest + 1
             logger.info(f"Resuming from block {start_block} (last in DB: {db_latest})")
         else:
-            # Start from ~1 hour ago
+            # Start from ~2 minutes ago (just catch real-time, don't backfill)
             current = self.w3.eth.block_number
-            start_block = current - 1800  # ~1800 blocks/hour on Polygon (2s blocks)
-            logger.info(f"No history in DB. Starting from block {start_block} (~1 hour ago)")
+            start_block = current - 60  # ~60 blocks = ~2 minutes on Polygon
+            logger.info(f"No history in DB. Starting from block {start_block} (current: {current})")
 
         self.last_block = start_block
 
@@ -493,28 +494,46 @@ class LiveTradeListener:
         if from_block > current_block:
             return  # caught up
 
-        # Fetch OrderFilled events from both exchange contracts
-        contracts = [
-            Web3.to_checksum_address(CTF_EXCHANGE),
-            Web3.to_checksum_address(NEGRISK_EXCHANGE),
-        ]
+        # Use raw JSON-RPC for get_logs (more control over format)
+        contracts = [CTF_EXCHANGE.lower(), NEGRISK_EXCHANGE.lower()]
+        topic_hex = "0x" + ORDER_FILLED_TOPIC.hex() if isinstance(ORDER_FILLED_TOPIC, bytes) else ORDER_FILLED_TOPIC
 
         all_logs = []
         for contract_addr in contracts:
             try:
-                logs = self.w3.eth.get_logs({
-                    "fromBlock": from_block,
-                    "toBlock": to_block,
-                    "address": contract_addr,
-                    "topics": [ORDER_FILLED_TOPIC],
-                })
+                payload = {
+                    "jsonrpc": "2.0",
+                    "method": "eth_getLogs",
+                    "params": [{
+                        "fromBlock": hex(from_block),
+                        "toBlock": hex(to_block),
+                        "address": contract_addr,
+                        "topics": [topic_hex],
+                    }],
+                    "id": 1,
+                }
+                resp = requests.post(self.alchemy_url, json=payload, timeout=30)
+                result = resp.json()
+
+                if "error" in result:
+                    logger.warning(f"RPC error for {contract_addr[:10]}: {result['error']}")
+                    if self.block_chunk > 10:
+                        self.block_chunk = max(10, self.block_chunk // 2)
+                        logger.info(f"Reduced block chunk to {self.block_chunk}")
+                    raise Exception(f"RPC error: {result['error']}")
+
+                logs = result.get("result", [])
+                # Convert hex fields to int for processing
+                for log in logs:
+                    log["blockNumber"] = int(log["blockNumber"], 16)
+                    log["logIndex"] = int(log["logIndex"], 16)
+                    log["transactionHash"] = log["transactionHash"]
+                    log["address"] = log["address"]
+                    # topics stay as hex strings
                 all_logs.extend(logs)
-            except Exception as e:
-                logger.warning(f"Error fetching logs from {contract_addr[:10]}...: {e}")
-                # Try smaller chunk on error
-                if self.block_chunk > 10:
-                    self.block_chunk = max(10, self.block_chunk // 2)
-                    logger.info(f"Reduced block chunk to {self.block_chunk}")
+
+            except requests.RequestException as e:
+                logger.warning(f"HTTP error fetching logs: {e}")
                 raise
 
         # Get block timestamps for this range (batch)
@@ -525,7 +544,7 @@ class LiveTradeListener:
         skipped = 0
 
         for log in all_logs:
-            trade = decode_order_filled(log, self.w3)
+            trade = self._decode_raw_log(log)
             if not trade:
                 continue
 
@@ -564,8 +583,60 @@ class LiveTradeListener:
             )
 
         # Gradually increase chunk size if we're behind
-        if blocks_behind > 500 and self.block_chunk < 2000:
-            self.block_chunk = min(2000, self.block_chunk * 2)
+        if blocks_behind > 500 and self.block_chunk < 500:
+            self.block_chunk = min(500, self.block_chunk * 2)
+
+    def _decode_raw_log(self, log):
+        """Decode a raw JSON-RPC log dict into a trade dict."""
+        topics = log.get("topics", [])
+        if len(topics) < 4:
+            return None
+
+        order_hash = topics[1]
+        maker = Web3.to_checksum_address("0x" + topics[2][-40:]).lower()
+        taker = Web3.to_checksum_address("0x" + topics[3][-40:]).lower()
+
+        data = log.get("data", "0x")
+        if isinstance(data, str):
+            data = bytes.fromhex(data[2:])
+
+        if len(data) < 160:
+            return None
+
+        maker_asset_id = int.from_bytes(data[0:32], "big")
+        taker_asset_id = int.from_bytes(data[32:64], "big")
+        maker_amount = int.from_bytes(data[64:96], "big")
+        taker_amount = int.from_bytes(data[96:128], "big")
+        fee = int.from_bytes(data[128:160], "big")
+
+        if maker_asset_id == 0:
+            side = "BUY"
+            asset_id = taker_asset_id
+            usdc_amount = maker_amount / 1e6
+            token_amount = taker_amount / 1e6
+            price = usdc_amount / token_amount if token_amount > 0 else 0
+        else:
+            side = "SELL"
+            asset_id = maker_asset_id
+            usdc_amount = taker_amount / 1e6
+            token_amount = maker_amount / 1e6
+            price = usdc_amount / token_amount if token_amount > 0 else 0
+
+        return {
+            "order_hash": order_hash,
+            "maker": maker,
+            "taker": taker,
+            "side": side,
+            "asset_id": str(asset_id),
+            "price": round(price, 4),
+            "size": round(token_amount, 2),
+            "usdc_amount": round(usdc_amount, 2),
+            "fee": fee / 1e6,
+            "block_number": log["blockNumber"],
+            "tx_hash": log["transactionHash"],
+            "log_index": log["logIndex"],
+            "contract": log["address"].lower(),
+        }
 
 
 # ================================================================
