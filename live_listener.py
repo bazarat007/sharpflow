@@ -81,7 +81,12 @@ class MarketMapper:
     def __init__(self):
         self.asset_to_market = {}  # asset_id -> {condition_id, question, outcome, category, ...}
         self.condition_cache = {}  # condition_id -> market metadata
+        self._failed_cache = {}   # asset_id -> (fail_count, last_attempt_time)
         self._lock = threading.Lock()
+        self._api_last_call = 0   # timestamp of last Gamma API call
+        self._api_min_interval = 0.15  # minimum seconds between Gamma calls
+        self._max_retries = 3     # max retries for failed lookups
+        self._retry_backoff = 300 # seconds before retrying a failed lookup
 
     def lookup(self, asset_id):
         """Look up market info for an asset ID. Returns dict or None."""
@@ -90,6 +95,24 @@ class MarketMapper:
             if asset_str in self.asset_to_market:
                 return self.asset_to_market[asset_str]
 
+            # Check if we recently failed on this asset_id (avoid hammering)
+            if asset_str in self._failed_cache:
+                fail_count, last_attempt = self._failed_cache[asset_str]
+                if fail_count >= self._max_retries:
+                    # Permanent failure — don't retry until backoff expires
+                    if time.time() - last_attempt < self._retry_backoff:
+                        return None
+                    else:
+                        # Backoff expired, reset and retry
+                        del self._failed_cache[asset_str]
+
+        # Rate limit: wait if we called too recently
+        now = time.time()
+        elapsed = now - self._api_last_call
+        if elapsed < self._api_min_interval:
+            time.sleep(self._api_min_interval - elapsed)
+        self._api_last_call = time.time()
+
         # Try Gamma API
         info = self._fetch_from_gamma(asset_str)
         if info:
@@ -97,31 +120,47 @@ class MarketMapper:
                 self.asset_to_market[asset_str] = info
             return info
 
+        # Track failure
+        with self._lock:
+            if asset_str in self._failed_cache:
+                fail_count, _ = self._failed_cache[asset_str]
+                self._failed_cache[asset_str] = (fail_count + 1, time.time())
+            else:
+                self._failed_cache[asset_str] = (1, time.time())
+
         return None
 
     def _fetch_from_gamma(self, asset_id):
         """Fetch market info from Polymarket Gamma API."""
         try:
-            # Search by token ID
-            url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={asset_id}&closed=false"
-            resp = requests.get(url, timeout=10)
-            if resp.status_code == 200:
+            # Search by token ID (try open markets first, then closed)
+            for closed_param in ["false", "true"]:
+                url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={asset_id}&closed={closed_param}"
+                resp = requests.get(url, timeout=10)
+
+                if resp.status_code == 429:
+                    logger.warning(f"Gamma API rate limited (429), backing off")
+                    time.sleep(5)
+                    return None
+
+                if resp.status_code != 200:
+                    logger.warning(f"Gamma API returned {resp.status_code} for asset {asset_id[:20]}...")
+                    continue
+
                 markets = resp.json()
                 if markets and len(markets) > 0:
                     m = markets[0]
-                    return self._parse_market(m, asset_id)
+                    parsed = self._parse_market(m, asset_id)
+                    if parsed and parsed.get("condition_id"):
+                        logger.debug(f"Mapped asset {asset_id[:20]}... → {parsed['question'][:60]}")
+                        return parsed
+                    else:
+                        logger.warning(f"Gamma returned market but no condition_id for asset {asset_id[:20]}...")
 
-            # Also try closed markets
-            url = f"https://gamma-api.polymarket.com/markets?clob_token_ids={asset_id}&closed=true"
-            resp = requests.get(url, timeout=10)
-            if resp.status_code == 200:
-                markets = resp.json()
-                if markets and len(markets) > 0:
-                    m = markets[0]
-                    return self._parse_market(m, asset_id)
-
+        except requests.exceptions.Timeout:
+            logger.warning(f"Gamma API timeout for asset {asset_id[:20]}...")
         except Exception as e:
-            logger.debug(f"Gamma API lookup failed for {asset_id[:20]}...: {e}")
+            logger.warning(f"Gamma API lookup failed for {asset_id[:20]}...: {e}")
 
         return None
 
@@ -413,6 +452,10 @@ class LiveTradeListener:
 
     def get_status(self):
         """Return current listener status."""
+        mapper_stats = {
+            "cached_assets": len(self.mapper.asset_to_market),
+            "failed_lookups": len(self.mapper._failed_cache),
+        }
         return {
             "running": self.running,
             "trades_ingested": self.trades_ingested,
@@ -422,6 +465,7 @@ class LiveTradeListener:
             "last_poll": self.last_poll_time,
             "started_at": self.started_at,
             "chain_connected": self.w3.is_connected() if self.w3 else False,
+            "mapper": mapper_stats,
         }
 
     def _run_loop(self):
