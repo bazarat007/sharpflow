@@ -436,6 +436,7 @@ class LiveTradeListener:
         self.block_chunk = block_chunk
         self.running = False
         self._thread = None
+        self._on_trades_callback = None
 
         # Stats
         self.trades_ingested = 0
@@ -444,6 +445,10 @@ class LiveTradeListener:
         self.last_block = 0
         self.last_poll_time = None
         self.started_at = None
+
+    def set_on_trades_callback(self, callback):
+        """Set a callback function that receives a list of (trade, market_info) after each poll batch."""
+        self._on_trades_callback = callback
 
     def start(self):
         """Start the listener in a background thread."""
@@ -599,6 +604,7 @@ class LiveTradeListener:
         # Process events
         inserted = 0
         skipped = 0
+        batch_inserted = []
 
         for log in all_logs:
             trade = self._decode_raw_log(log)
@@ -625,11 +631,33 @@ class LiveTradeListener:
             # Write to DB
             if self.db.insert_trade(trade, market_info, block_timestamps[bn]):
                 inserted += 1
+                # Collect for callback
+                if self._on_trades_callback:
+                    batch_inserted.append({
+                        "wallet": trade["maker"],
+                        "condition_id": market_info.get("condition_id", "") if market_info else "",
+                        "asset_id": trade["asset_id"],
+                        "side": trade["side"],
+                        "price": trade["price"],
+                        "size": trade["size"],
+                        "usdc_amount": trade["usdc_amount"],
+                        "timestamp": block_timestamps[bn],
+                        "outcome": market_info.get("outcome", "") if market_info else "",
+                        "title": market_info.get("question", "") if market_info else "",
+                        "category": market_info.get("category", "other") if market_info else "other",
+                    })
 
         self.trades_ingested += inserted
         self.trades_skipped += skipped
         self.last_block = to_block + 1
         self.last_poll_time = datetime.now(timezone.utc).isoformat()
+
+        # Fire callback with batch of inserted trades
+        if batch_inserted and self._on_trades_callback:
+            try:
+                self._on_trades_callback(batch_inserted)
+            except Exception as e:
+                logger.error(f"Trade callback error: {e}")
 
         blocks_behind = current_block - to_block
         if inserted > 0 or blocks_behind > 100:
