@@ -2946,6 +2946,21 @@ def trigger_retention_cleanup():
     return {"status": "started", "message": f"Retention cleanup running (deleting rows older than {LIVE_TRADES_RETENTION_DAYS} days)"}
 
 
+@app.get("/api/live_scoring")
+def get_live_scoring_status():
+    """Get live event-driven scoring stats."""
+    with live_wallet_scores_lock:
+        sharp_count = sum(1 for s in live_wallet_scores.values() if s["tier"] == "sharp")
+        total_scored = len(live_wallet_scores)
+        convergence_count = len(live_convergence_signals)
+    return {
+        **live_scoring_stats,
+        "wallets_tracked": total_scored,
+        "sharp_wallets": sharp_count,
+        "live_convergence_signals": convergence_count,
+    }
+
+
 # ================================================================
 # BACKTESTING ENGINE
 # ================================================================
@@ -3510,6 +3525,415 @@ def dashboard():
 
 
 # ================================================================
+# EVENT-DRIVEN LIVE SCORING
+# ================================================================
+
+# In-memory cache for live wallet scores (updated on each trade)
+live_wallet_scores = {}  # wallet -> score dict
+live_wallet_scores_lock = threading.Lock()
+live_convergence_signals = []  # latest live convergence signals
+live_scoring_stats = {
+    "trades_processed": 0,
+    "wallets_rescored": 0,
+    "convergence_checks": 0,
+    "last_trade_time": None,
+    "errors": 0,
+}
+
+
+def db_get_live_trades_for_wallet(wallet, months_back=2):
+    """Pull all trades for a specific wallet from live_trades within the scoring window."""
+    if not DATABASE_URL:
+        return []
+    try:
+        conn = db_conn()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cutoff = int((datetime.utcnow() - timedelta(days=months_back * 30)).timestamp())
+        cur.execute("""
+            SELECT wallet, condition_id, side, outcome, price, size,
+                   timestamp, title, category
+            FROM live_trades
+            WHERE wallet = %s AND timestamp > %s
+            ORDER BY timestamp DESC
+        """, (wallet, cutoff))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error(f"Error loading live trades for {wallet[:10]}: {e}")
+        return []
+
+
+def db_get_live_trades_for_market(condition_id, months_back=2):
+    """Pull all trades for a specific market from live_trades."""
+    if not DATABASE_URL:
+        return []
+    try:
+        conn = db_conn()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cutoff = int((datetime.utcnow() - timedelta(days=months_back * 30)).timestamp())
+        cur.execute("""
+            SELECT wallet, condition_id, side, outcome, price, size,
+                   timestamp, title, category
+            FROM live_trades
+            WHERE condition_id = %s AND timestamp > %s
+            ORDER BY timestamp DESC
+        """, (condition_id, cutoff))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error(f"Error loading live trades for market {condition_id[:10]}: {e}")
+        return []
+
+
+def score_single_wallet(wallet, trades):
+    """Score a single wallet using the same algorithm as score_all_wallets.
+    Returns a score dict or None if wallet doesn't meet thresholds."""
+
+    # Group by market, filtering dust trades
+    market_groups = defaultdict(list)
+    for t in trades:
+        notional = t["price"] * t["size"]
+        if notional < MIN_TRADE_NOTIONAL:
+            continue
+        cid = t.get("condition_id", "")
+        if not cid:
+            continue
+        market_groups[cid].append(t)
+
+    distinct = len(market_groups)
+    if distinct < MIN_MARKETS:
+        return None
+
+    clvs = []
+    timing_scores = []
+    market_pnls = {}
+    total_inv = 0.0
+    total_ret = 0.0
+    categories = set()
+    trade_count = 0
+
+    for cid, mtrades in market_groups.items():
+        mpnl = 0.0
+        for t in mtrades:
+            price = t["price"]
+            side = t["side"]
+            size = t["size"]
+            outcome = (t.get("outcome") or "").lower()
+            win_outcome = (t.get("winning_outcome") or "").lower()
+            categories.add(t.get("category", "other"))
+
+            # For live trades, we don't have winning_outcome yet (market not resolved)
+            # Use market resolution from the markets table if available
+            if not win_outcome:
+                continue
+
+            outcome_won = (outcome == win_outcome)
+            res_price = 1.0 if outcome_won else 0.0
+            trade_count += 1
+
+            if side == "BUY":
+                if price >= 0.95 and outcome_won:
+                    continue
+                clvs.append(res_price - price)
+                timing_scores.append((0.5 - price) if outcome_won else (price - 0.5))
+                pnl = (res_price - price) * size
+                total_inv += price * size
+                total_ret += res_price * size
+                mpnl += pnl
+            elif side == "SELL":
+                clvs.append(price - res_price)
+                timing_scores.append((price - 0.5) if not outcome_won else (0.5 - price))
+                pnl = (price - res_price) * size
+                total_inv += (1.0 - price) * size
+                total_ret += (1.0 - res_price) * size
+                mpnl += pnl
+
+        market_pnls[cid] = mpnl
+
+    if not clvs or trade_count == 0:
+        return None
+
+    avg_clv = float(np.mean(clvs))
+    clv_score = max(0, min(1, (avg_clv + 0.1) / 0.52))
+
+    avg_timing = float(np.mean(timing_scores)) if timing_scores else 0
+    early_pct = sum(1 for t in timing_scores if t > 0) / len(timing_scores) if timing_scores else 0
+    timing_score = max(0, min(1, (early_pct - 0.1) / 0.6))
+
+    mkt_won = sum(1 for p in market_pnls.values() if p > 0)
+    mkt_lost = sum(1 for p in market_pnls.values() if p <= 0)
+    win_rate = mkt_won / len(market_pnls) if market_pnls else 0
+    market_count_factor = min(1.0, (distinct / 100) ** 0.5)
+    consistency_score = win_rate * market_count_factor
+
+    total_pnl = total_ret - total_inv
+    roi = total_pnl / total_inv if total_inv > 0 else 0
+    roi_score = max(0, min(1, (roi + 0.2) / 1.0))
+
+    sharpness = W_CLV * clv_score + W_TIMING * timing_score + W_CONSISTENCY * consistency_score + W_ROI * roi_score
+
+    if sharpness >= 0.38 and total_pnl > 0 and avg_clv > 0:
+        tier = "sharp"
+    elif sharpness >= 0.25:
+        tier = "average"
+    else:
+        tier = "dull"
+
+    return {
+        "wallet": wallet,
+        "display_name": wallet[:12] + "...",
+        "sharpness_score": round(sharpness, 4),
+        "tier": tier,
+        "clv_score": round(clv_score, 4),
+        "timing_score": round(timing_score, 4),
+        "consistency_score": round(consistency_score, 4),
+        "roi_score": round(roi_score, 4),
+        "avg_clv": round(avg_clv, 4),
+        "avg_timing_alpha": round(avg_timing, 4),
+        "early_entry_pct": round(early_pct, 4),
+        "win_rate": round(win_rate, 4),
+        "roi": round(roi, 4),
+        "total_pnl": round(total_pnl, 2),
+        "total_invested": round(total_inv, 2),
+        "total_trades": trade_count,
+        "distinct_markets": distinct,
+        "markets_won": mkt_won,
+        "markets_lost": mkt_lost,
+        "categories": sorted(categories),
+        "scored_at": datetime.utcnow().isoformat(),
+        "source": "live",
+    }
+
+
+def check_live_convergence(condition_id):
+    """Check if a market has convergence from live-scored sharp wallets.
+    Lightweight version — only checks the specific market."""
+
+    with live_wallet_scores_lock:
+        sharp_wallets = {w: s for w, s in live_wallet_scores.items() if s["sharpness_score"] >= 0.38}
+
+    if len(sharp_wallets) < 3:
+        return None
+
+    # Get all live trades for this market
+    market_trades = db_get_live_trades_for_market(condition_id)
+    if not market_trades:
+        return None
+
+    # Group by wallet and direction
+    yes_wallets = []
+    no_wallets = []
+
+    for t in market_trades:
+        wallet = t["wallet"]
+        if wallet not in sharp_wallets:
+            continue
+
+        notional = t["price"] * t["size"]
+        if notional < 50:
+            continue
+
+        wdata = sharp_wallets[wallet]
+        entry = {
+            "wallet": wallet,
+            "display_name": wdata["display_name"],
+            "sharpness_score": wdata["sharpness_score"],
+            "tier": wdata["tier"],
+            "size": t["size"],
+            "price": t["price"],
+            "notional": round(notional, 2),
+        }
+
+        side = t["side"].upper()
+        if side == "BUY":
+            yes_wallets.append(entry)
+        else:
+            no_wallets.append(entry)
+
+    # Check both directions
+    signals = []
+    title = market_trades[0].get("title", condition_id[:20]) if market_trades else condition_id[:20]
+
+    for direction, wallets, opposition in [("YES", yes_wallets, no_wallets), ("NO", no_wallets, yes_wallets)]:
+        # Deduplicate by wallet (keep largest position)
+        seen = {}
+        for w in wallets:
+            addr = w["wallet"]
+            if addr not in seen or w["size"] > seen[addr]["size"]:
+                seen[addr] = w
+        unique = list(seen.values())
+
+        if len(unique) < 3:
+            continue
+
+        combined_score = sum(w["sharpness_score"] for w in unique)
+        if combined_score < 1.0:
+            continue
+
+        total_notional = sum(w["notional"] for w in unique)
+        if total_notional < 200:
+            continue
+
+        opp_seen = {}
+        for w in opposition:
+            if w["wallet"] not in opp_seen:
+                opp_seen[w["wallet"]] = w
+        opp_score = sum(w["sharpness_score"] for w in opp_seen.values())
+        agreement = combined_score / (combined_score + opp_score) if (combined_score + opp_score) > 0 else 1.0
+
+        sharp_count = sum(1 for w in unique if w["tier"] == "sharp")
+        total_size = sum(w["size"] for w in unique)
+
+        strength = (
+            0.25 * min(1, len(unique) / 5) +
+            0.25 * min(1, combined_score / 2.5) +
+            0.25 * agreement +
+            0.25 * min(1, total_notional / 5000)
+        )
+
+        if sharp_count >= 5 and len(unique) >= 6:
+            sig_type = "STRONG_CONVERGENCE"
+        elif sharp_count >= 3 and len(unique) >= 4:
+            sig_type = "CONVERGENCE"
+        else:
+            sig_type = "MILD_CONVERGENCE"
+
+        signals.append({
+            "market_id": condition_id,
+            "market_title": title,
+            "side": direction,
+            "signal_type": sig_type,
+            "strength": round(strength, 4),
+            "wallet_count": len(unique),
+            "sharp_count": sharp_count,
+            "combined_sharpness": round(combined_score, 4),
+            "opposition_score": round(opp_score, 4),
+            "agreement_ratio": round(agreement, 4),
+            "total_size": round(total_size, 2),
+            "total_notional": round(total_notional, 2),
+            "wallets": sorted(unique, key=lambda w: w["sharpness_score"], reverse=True)[:10],
+            "source": "live",
+            "detected_at": datetime.utcnow().isoformat(),
+        })
+
+    return signals if signals else None
+
+
+def on_live_trades(trades_batch):
+    """Callback from live listener. Scores affected wallets and checks convergence.
+    Called after each poll batch with list of inserted trade dicts."""
+
+    if not trades_batch:
+        return
+
+    live_scoring_stats["trades_processed"] += len(trades_batch)
+    live_scoring_stats["last_trade_time"] = datetime.utcnow().isoformat()
+
+    # Collect unique wallets and markets from this batch
+    affected_wallets = set()
+    affected_markets = set()
+    for t in trades_batch:
+        affected_wallets.add(t["wallet"])
+        cid = t.get("condition_id", "")
+        if cid:
+            affected_markets.add(cid)
+
+    # Re-score each affected wallet
+    for wallet in affected_wallets:
+        try:
+            # Get all trades for this wallet (from both live_trades AND historical trades table)
+            live_trades = db_get_live_trades_for_wallet(wallet, months_back=SCORING_WINDOW_MONTHS)
+
+            # Also pull from historical trades table for resolved market data
+            hist_trades = []
+            try:
+                conn = db_conn()
+                cur = conn.cursor(cursor_factory=RealDictCursor)
+                cutoff = int((datetime.utcnow() - timedelta(days=SCORING_WINDOW_MONTHS * 30)).timestamp())
+                cur.execute("""
+                    SELECT wallet, condition_id, side, outcome, price, size,
+                           timestamp, title, category, winning_outcome
+                    FROM trades
+                    WHERE wallet = %s AND timestamp > %s
+                """, (wallet, cutoff))
+                hist_trades = [dict(r) for r in cur.fetchall()]
+                cur.close()
+                conn.close()
+            except Exception:
+                pass
+
+            # Merge: historical trades have winning_outcome, live trades may not
+            # Deduplicate by (wallet, condition_id, timestamp, side, price)
+            all_trades = list(hist_trades)
+            existing_sigs = set()
+            for t in hist_trades:
+                sig = (t["wallet"], t["condition_id"], t.get("timestamp", 0), t["side"], t["price"])
+                existing_sigs.add(sig)
+
+            for t in live_trades:
+                sig = (t["wallet"], t["condition_id"], t.get("timestamp", 0), t["side"], t["price"])
+                if sig not in existing_sigs:
+                    all_trades.append(t)
+                    existing_sigs.add(sig)
+
+            if not all_trades:
+                continue
+
+            score = score_single_wallet(wallet, all_trades)
+            if score:
+                with live_wallet_scores_lock:
+                    live_wallet_scores[wallet] = score
+                live_scoring_stats["wallets_rescored"] += 1
+
+                # Update the main state scored_wallets if this wallet is sharp
+                if score["tier"] == "sharp" and state.get("scored_wallets"):
+                    # Update or add to the main scored wallets list
+                    existing = next((w for w in state["scored_wallets"] if w["wallet"] == wallet), None)
+                    if existing:
+                        existing.update(score)
+                    else:
+                        score["rank"] = len(state["scored_wallets"]) + 1
+                        state["scored_wallets"].append(score)
+
+        except Exception as e:
+            live_scoring_stats["errors"] += 1
+            logger.error(f"Live scoring error for {wallet[:10]}: {e}")
+
+    # Check convergence for affected markets
+    for cid in affected_markets:
+        try:
+            signals = check_live_convergence(cid)
+            if signals:
+                live_scoring_stats["convergence_checks"] += 1
+                with live_wallet_scores_lock:
+                    # Merge with existing live convergence signals
+                    # Remove old signals for this market, add new ones
+                    live_convergence_signals[:] = [
+                        s for s in live_convergence_signals if s["market_id"] != cid
+                    ] + signals
+
+                # Also update main state convergence signals
+                if state.get("convergence_signals") is not None:
+                    # Remove old live signals for this market
+                    state["convergence_signals"] = [
+                        s for s in state["convergence_signals"]
+                        if not (s.get("market_id") == cid and s.get("source") == "live")
+                    ] + signals
+
+                logger.info(f"Live convergence detected on {signals[0]['market_title'][:40]}: "
+                           f"{signals[0]['signal_type']} {signals[0]['side']} "
+                           f"({signals[0]['wallet_count']} wallets, strength {signals[0]['strength']})")
+
+        except Exception as e:
+            live_scoring_stats["errors"] += 1
+            logger.error(f"Live convergence check error for {cid[:10]}: {e}")
+
+
+# ================================================================
 # RETENTION POLICY
 # ================================================================
 
@@ -3600,9 +4024,10 @@ pipeline_thread.start()
 ALCHEMY_URL = os.getenv("ALCHEMY_URL", "")
 if ALCHEMY_URL and DATABASE_URL:
     try:
-        from live_listener import start_listener, get_listener_status
-        start_listener(DATABASE_URL, ALCHEMY_URL, poll_interval=5)
-        logger.info("Live trade listener started")
+        from live_listener import start_listener, get_listener_status, _listener_instance
+        listener = start_listener(DATABASE_URL, ALCHEMY_URL, poll_interval=5)
+        listener.set_on_trades_callback(on_live_trades)
+        logger.info("Live trade listener started with event-driven scoring callback")
     except Exception as e:
         logger.error(f"Failed to start live listener: {e}")
 else:
