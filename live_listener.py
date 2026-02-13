@@ -150,15 +150,11 @@ class MarketMapper:
                 markets = resp.json()
                 if markets and len(markets) > 0:
                     m = markets[0]
-                    # Debug: log available keys when condition_id is missing
+                    # Debug: log ALL keys when condition_id is missing
                     if not m.get("condition_id"):
                         logger.info(
-                            f"Gamma response keys for asset {asset_id[:20]}...: "
-                            f"condition_id={m.get('condition_id', 'MISSING')!r}, "
-                            f"question_id={m.get('question_id', 'MISSING')!r}, "
-                            f"neg_risk={m.get('neg_risk', 'MISSING')!r}, "
-                            f"neg_risk_market_id={m.get('neg_risk_market_id', 'MISSING')!r}, "
-                            f"question={m.get('question', '')[:60]!r}"
+                            f"Gamma ALL KEYS for asset {asset_id[:20]}...: "
+                            f"{sorted(m.keys())}"
                         )
                     parsed = self._parse_market(m, asset_id)
                     if parsed and parsed.get("condition_id"):
