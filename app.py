@@ -2265,6 +2265,7 @@ def run_pipeline():
 
         # Step 4: Detect convergence
         signals = detect_convergence(scored, trades)
+        add_kelly_to_signals(signals)
 
         # Merge batch convergence with any live convergence signals
         live_signals = [s for s in live_convergence_signals if s.get("source") == "live"]
@@ -2984,6 +2985,38 @@ def get_live_scoring_status():
         "sharp_wallets": sharp_count,
         "live_convergence_signals": convergence_count,
         "convergence_details": live_convergence_signals[:10],
+    }
+
+
+@app.get("/api/kelly")
+def get_kelly_signals(bankroll: float = Query(default=1000, description="Your bankroll in USD")):
+    """Get convergence signals with Kelly sizing recommendations."""
+    signals = state.get("convergence_signals", [])
+    if not signals:
+        return {"signals": [], "bankroll": bankroll, "message": "No convergence signals yet"}
+
+    # Recompute Kelly with custom bankroll
+    sized = []
+    for sig in signals:
+        kelly = compute_kelly_size(sig, bankroll)
+        sized.append({
+            "market": sig.get("market_title", ""),
+            "side": sig.get("side", ""),
+            "signal_type": sig.get("signal_type", ""),
+            "strength": sig.get("strength", 0),
+            "freshness": sig.get("freshness", 0),
+            "wallet_count": sig.get("wallet_count", 0),
+            "market_price": sig.get("market_price", 0),
+            "kelly": kelly,
+        })
+
+    # Sort by recommended size descending
+    sized.sort(key=lambda s: s["kelly"]["recommended_size_usd"], reverse=True)
+
+    return {
+        "signals": sized,
+        "bankroll": bankroll,
+        "total_recommended": round(sum(s["kelly"]["recommended_size_usd"] for s in sized), 2),
     }
 
 
@@ -3872,6 +3905,8 @@ def check_live_convergence(condition_id):
             "detected_at": datetime.utcnow().isoformat(),
         })
 
+    if signals:
+        add_kelly_to_signals(signals)
     return signals if signals else None
 
 
@@ -3940,6 +3975,106 @@ def on_live_trades(trades_batch):
         except Exception as e:
             live_scoring_stats["errors"] += 1
             logger.error(f"Live convergence check error for {cid[:10]}: {e}")
+
+
+# ================================================================
+# KELLY SIZING
+# ================================================================
+
+def compute_kelly_size(signal, bankroll=1000):
+    """Compute recommended position size using Kelly criterion.
+    
+    Kelly formula: f* = (bp - q) / b
+    Where:
+        f* = fraction of bankroll to bet
+        b  = odds (payout ratio: net winnings per dollar risked)
+        p  = estimated probability of winning
+        q  = 1 - p
+    
+    For prediction markets:
+        - Market price = implied probability
+        - Our edge comes from sharp wallets having better-than-market win rates
+        - We estimate true probability from the convergence signal data
+    
+    We use fractional Kelly (25%) to reduce variance, which is standard practice.
+    """
+    
+    market_price = signal.get("market_price", 0.5)
+    side = signal.get("side", "YES")
+    strength = signal.get("strength", 0)
+    agreement = signal.get("agreement_ratio", 0.5)
+    wallet_count = signal.get("wallet_count", 0)
+    combined_sharpness = signal.get("combined_sharpness", 0)
+    freshness = signal.get("freshness", 0.5)
+    
+    # Entry price: what we'd pay to enter this position
+    if side == "YES":
+        entry_price = market_price
+    else:
+        entry_price = 1.0 - market_price
+    
+    # Guard against extreme prices
+    if entry_price <= 0.05 or entry_price >= 0.95:
+        return _kelly_result(0, 0, entry_price, entry_price, "price_extreme", bankroll)
+    
+    # Estimate true probability (our edge estimate)
+    # Start with market price as base, then adjust upward based on signal quality
+    # The adjustment is conservative: max +15 percentage points of edge
+    edge_factors = (
+        0.30 * min(1, wallet_count / 5) +       # more wallets = more confidence
+        0.25 * min(1, combined_sharpness / 2.5) + # sharper wallets = more edge
+        0.25 * agreement +                         # less opposition = more conviction
+        0.20 * freshness                           # fresh signals = edge hasn't decayed
+    )
+    
+    max_edge = 0.15  # cap edge estimate at 15 percentage points
+    estimated_edge = edge_factors * max_edge
+    
+    estimated_prob = entry_price + estimated_edge
+    estimated_prob = max(0.05, min(0.95, estimated_prob))
+    
+    # Kelly calculation
+    # In prediction markets: pay entry_price, win 1.00 if correct
+    # So odds b = (1 - entry_price) / entry_price
+    b = (1.0 - entry_price) / entry_price
+    p = estimated_prob
+    q = 1.0 - p
+    
+    kelly_full = (b * p - q) / b
+    
+    if kelly_full <= 0:
+        return _kelly_result(0, 0, entry_price, estimated_prob, "no_edge", bankroll)
+    
+    # Use fractional Kelly (25%) to reduce variance
+    kelly_fraction = 0.25
+    kelly_pct = kelly_full * kelly_fraction
+    
+    # Cap at 10% of bankroll per position
+    kelly_pct = min(kelly_pct, 0.10)
+    
+    recommended_size = round(bankroll * kelly_pct, 2)
+    
+    return _kelly_result(kelly_pct, recommended_size, entry_price, estimated_prob, "sized", bankroll)
+
+
+def _kelly_result(kelly_pct, size, entry_price, est_prob, status, bankroll):
+    """Build Kelly sizing result dict."""
+    return {
+        "kelly_fraction": round(kelly_pct, 4),
+        "recommended_size_usd": round(size, 2),
+        "entry_price": round(entry_price, 4),
+        "estimated_true_prob": round(est_prob, 4),
+        "estimated_edge": round(max(0, est_prob - entry_price), 4),
+        "bankroll_assumed": bankroll,
+        "status": status,
+    }
+
+
+def add_kelly_to_signals(signals, bankroll=1000):
+    """Add Kelly sizing to a list of convergence signals."""
+    for sig in signals:
+        sig["kelly"] = compute_kelly_size(sig, bankroll)
+    return signals
 
 
 # ================================================================
