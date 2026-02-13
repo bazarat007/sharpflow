@@ -150,12 +150,6 @@ class MarketMapper:
                 markets = resp.json()
                 if markets and len(markets) > 0:
                     m = markets[0]
-                    # Debug: log ALL keys when condition_id is missing
-                    if not m.get("condition_id"):
-                        logger.info(
-                            f"Gamma ALL KEYS for asset {asset_id[:20]}...: "
-                            f"{sorted(m.keys())}"
-                        )
                     parsed = self._parse_market(m, asset_id)
                     if parsed and parsed.get("condition_id"):
                         logger.debug(f"Mapped asset {asset_id[:20]}... → {parsed['question'][:60]}")
@@ -172,17 +166,28 @@ class MarketMapper:
 
     def _parse_market(self, m, asset_id):
         """Parse Gamma API market response."""
-        # condition_id can be empty for NegRisk (multi-outcome) markets
-        # Fall back to question_id or neg_risk_market_id
-        condition_id = m.get("condition_id", "") or m.get("question_id", "") or m.get("neg_risk_market_id", "")
+        # Gamma API returns camelCase keys
+        condition_id = m.get("conditionId", "") or m.get("questionID", "") or m.get("negRiskMarketID", "")
         question = m.get("question", "")
 
         # Determine which outcome this token represents
-        tokens = m.get("tokens", [])
+        # Gamma returns outcomes as a list of strings and clobTokenIds as a comma-separated string
         outcome = "unknown"
-        for tok in tokens:
-            if str(tok.get("token_id", "")) == str(asset_id):
-                outcome = tok.get("outcome", "unknown")
+        clob_ids = m.get("clobTokenIds", "")
+        outcomes = m.get("outcomes", "")
+
+        # Parse outcomes and token IDs
+        if isinstance(outcomes, str):
+            try:
+                outcomes = json.loads(outcomes)
+            except (json.JSONDecodeError, TypeError):
+                outcomes = []
+        if isinstance(clob_ids, str):
+            clob_ids = [t.strip() for t in clob_ids.split(",") if t.strip()]
+
+        for i, token_id in enumerate(clob_ids):
+            if str(token_id) == str(asset_id) and i < len(outcomes):
+                outcome = outcomes[i]
                 break
 
         # Categorize
@@ -193,10 +198,10 @@ class MarketMapper:
             "question": question,
             "outcome": outcome,
             "category": category,
-            "end_date": m.get("end_date_iso", ""),
+            "end_date": m.get("endDateIso", ""),
             "active": m.get("active", True),
             "closed": m.get("closed", False),
-            "winning_outcome": m.get("winning_outcome", ""),
+            "winning_outcome": m.get("resolvedBy", ""),
         }
 
     def _categorize(self, title):
