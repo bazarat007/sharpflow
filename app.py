@@ -4095,26 +4095,33 @@ def add_kelly_to_signals(signals, bankroll=1000):
 
 
 # ================================================================
-# SUSPICIOUS CONVICTION DETECTOR
+# SUSPICIOUS CONVICTION DETECTOR — "BURNER WALLET INSIDER"
 # ================================================================
 
 def detect_suspicious_conviction(trades):
-    """Detect wallets with insider-like trading patterns.
+    """Detect burner wallet insider patterns.
     
-    Flags wallets that show anomalous conviction patterns suggesting
+    Targets wallets that look like short-lived accounts created to exploit
     non-public information:
     
-    1. HIGH-PRICE CONVICTION: Large bets at 80¢+ that win at abnormal rates
-       (normal win rate at 80¢ is ~80%, suspicious is 95%+)
-    2. SINGLE-MARKET CONCENTRATION: Huge position in one market relative to
-       their other activity (10x+ their average)
-    3. PERFECT TIMING: Consistently entering within hours of favorable resolution
-    4. SIZE ESCALATION: Position size increases dramatically on winning trades
-       (doubling down with apparent certainty)
+    CRITERIA:
+    1. YOUNG WALLET: First trade < 60 days ago
+    2. HIGH AVG BET SIZE: Average notional per market > $5K
+    3. SINGLE ENTRY PER MARKET: No DCA, no averaging — one decisive bet
+    4. HIGH WIN RATE: > 85% across 5+ resolved markets
+    5. NO HEDGING: Never takes opposing positions on same market
+    6. SHORT DURATION PREFERENCE: Majority of bets on markets resolving within 7 days
+    
+    Suspicion tiers:
+    - HIGHLY SUSPICIOUS: Score >= 0.7 (multiple strong signals)
+    - SUSPICIOUS: Score >= 0.4
+    - WATCHLIST: Score >= 0.2
     
     Returns list of flagged wallets with suspicion scores and evidence.
     """
-    logger.info("Running suspicious conviction detector...")
+    logger.info("Running burner wallet insider detector...")
+    
+    now_ts = int(time.time())
     
     # Group trades by wallet
     wallet_trades = defaultdict(list)
@@ -4124,13 +4131,17 @@ def detect_suspicious_conviction(trades):
     flagged = []
     
     for wallet, wtrades in wallet_trades.items():
-        # Need some minimum activity to detect patterns
         if len(wtrades) < 3:
             continue
         
-        signals = []
-        suspicion_score = 0
-        evidence = []
+        # ---- Compute wallet profile ----
+        timestamps = [t.get("timestamp", 0) for t in wtrades if t.get("timestamp", 0) > 0]
+        if not timestamps:
+            continue
+        
+        first_trade_ts = min(timestamps)
+        last_trade_ts = max(timestamps)
+        wallet_age_days = (now_ts - first_trade_ts) / 86400
         
         # Group by market
         market_groups = defaultdict(list)
@@ -4139,179 +4150,250 @@ def detect_suspicious_conviction(trades):
             if cid:
                 market_groups[cid].append(t)
         
-        # ---- PATTERN 1: High-price conviction with anomalous win rate ----
-        high_price_trades = []
-        high_price_wins = 0
-        high_price_total = 0
+        if len(market_groups) < 3:
+            continue
         
-        for t in wtrades:
-            price = t["price"]
-            side = t["side"]
-            outcome = (t.get("outcome") or "").lower()
-            win_outcome = (t.get("winning_outcome") or "").lower()
-            
-            if not win_outcome:
-                continue
-            
-            # BUY at high price (80¢+) or SELL at low price (20¢ or less)
-            is_high_conviction = (side == "BUY" and price >= 0.80) or (side == "SELL" and price <= 0.20)
-            if not is_high_conviction:
-                continue
-            
-            notional = price * t["size"]
-            if notional < 100:
-                continue
-            
-            high_price_total += 1
-            outcome_won = (outcome == win_outcome)
-            
-            if side == "BUY" and outcome_won:
-                high_price_wins += 1
-                high_price_trades.append(t)
-            elif side == "SELL" and not outcome_won:
-                high_price_wins += 1
-                high_price_trades.append(t)
+        # ---- SIGNAL 1: Young wallet (< 60 days) ----
+        young_score = 0
+        if wallet_age_days <= 14:
+            young_score = 1.0
+        elif wallet_age_days <= 30:
+            young_score = 0.7
+        elif wallet_age_days <= 60:
+            young_score = 0.4
+        # Older wallets get 0 — not a burner
         
-        if high_price_total >= 5:
-            high_price_wr = high_price_wins / high_price_total
-            # At 80¢+, expected win rate is ~80%. Flag if significantly above.
-            if high_price_wr >= 0.95:
-                score = min(1.0, (high_price_wr - 0.80) / 0.20) * 0.4
-                suspicion_score += score
-                signals.append("HIGH_PRICE_CONVICTION")
-                total_notional = sum(t["price"] * t["size"] for t in high_price_trades)
-                evidence.append({
-                    "pattern": "HIGH_PRICE_CONVICTION",
-                    "detail": f"{high_price_wins}/{high_price_total} wins at 80¢+ ({high_price_wr:.0%} vs ~80% expected)",
-                    "total_notional": round(total_notional, 2),
-                    "score_contribution": round(score, 4),
-                })
+        if young_score == 0:
+            continue  # Skip wallets older than 60 days entirely
         
-        # ---- PATTERN 2: Single-market concentration ----
-        if len(market_groups) >= 2:
-            market_notionals = {}
-            for cid, mtrades in market_groups.items():
-                market_notionals[cid] = sum(t["price"] * t["size"] for t in mtrades)
-            
-            avg_notional = sum(market_notionals.values()) / len(market_notionals)
-            max_cid = max(market_notionals, key=market_notionals.get)
-            max_notional = market_notionals[max_cid]
-            
-            if avg_notional > 0 and max_notional >= 500:
-                concentration_ratio = max_notional / avg_notional
-                if concentration_ratio >= 10:
-                    # Check if they won this concentrated bet
-                    max_trades = market_groups[max_cid]
-                    won = any(
-                        (t.get("outcome") or "").lower() == (t.get("winning_outcome") or "").lower()
-                        for t in max_trades
-                        if t.get("winning_outcome")
-                    )
-                    
-                    if won:
-                        score = min(1.0, (concentration_ratio - 5) / 20) * 0.3
-                        suspicion_score += score
-                        signals.append("CONCENTRATED_BET")
-                        title = max_trades[0].get("title", max_cid[:20])
-                        evidence.append({
-                            "pattern": "CONCENTRATED_BET",
-                            "detail": f"${max_notional:,.0f} in '{title[:50]}' ({concentration_ratio:.0f}x avg market size) — WON",
-                            "market": max_cid,
-                            "concentration_ratio": round(concentration_ratio, 1),
-                            "score_contribution": round(score, 4),
-                        })
-        
-        # ---- PATTERN 3: Size escalation on winners ----
-        # Look for wallets that dramatically increase size right before winning
+        # ---- SIGNAL 2: High average bet size ----
+        market_notionals = {}
         for cid, mtrades in market_groups.items():
-            if len(mtrades) < 2:
-                continue
-            
-            # Sort by timestamp
-            sorted_trades = sorted(mtrades, key=lambda t: t.get("timestamp", 0))
-            sizes = [t["price"] * t["size"] for t in sorted_trades]
-            
-            if len(sizes) >= 2 and sizes[0] > 0:
-                # Check if last trade is much larger than first
-                escalation = sizes[-1] / sizes[0]
-                last_trade = sorted_trades[-1]
-                win_outcome = (last_trade.get("winning_outcome") or "").lower()
-                outcome = (last_trade.get("outcome") or "").lower()
-                
-                if escalation >= 5 and sizes[-1] >= 500 and win_outcome and outcome == win_outcome:
-                    score = min(1.0, (escalation - 3) / 20) * 0.2
-                    suspicion_score += score
-                    signals.append("SIZE_ESCALATION")
-                    title = last_trade.get("title", cid[:20])
-                    evidence.append({
-                        "pattern": "SIZE_ESCALATION",
-                        "detail": f"Escalated {escalation:.0f}x in '{title[:50]}' (${sizes[0]:,.0f} → ${sizes[-1]:,.0f}) — WON",
-                        "market": cid,
-                        "escalation_factor": round(escalation, 1),
-                        "score_contribution": round(score, 4),
-                    })
+            market_notionals[cid] = sum(t["price"] * t["size"] for t in mtrades)
         
-        # ---- PATTERN 4: Perfect timing (if we have resolution timestamps) ----
-        # This checks if the wallet consistently enters close to resolution
-        # We approximate by looking at trades near the end of the scoring window
-        # that all resolve favorably
-        late_wins = 0
-        late_total = 0
+        total_volume = sum(market_notionals.values())
+        avg_market_size = total_volume / len(market_groups) if market_groups else 0
+        
+        size_score = 0
+        if avg_market_size >= 25000:
+            size_score = 1.0
+        elif avg_market_size >= 10000:
+            size_score = 0.7
+        elif avg_market_size >= 5000:
+            size_score = 0.4
+        elif avg_market_size >= 2000:
+            size_score = 0.2
+        # Below $2K avg — not interesting
+        
+        if size_score == 0:
+            continue
+        
+        # ---- SIGNAL 3: Single entry per market (no DCA) ----
+        single_entry_markets = 0
+        multi_entry_markets = 0
         for cid, mtrades in market_groups.items():
-            if not mtrades:
-                continue
-            sorted_trades = sorted(mtrades, key=lambda t: t.get("timestamp", 0))
-            last_trade = sorted_trades[-1]
-            win_outcome = (last_trade.get("winning_outcome") or "").lower()
-            outcome = (last_trade.get("outcome") or "").lower()
-            
-            if not win_outcome:
-                continue
-            
-            # Single trade in the market (no averaging, just one decisive bet)
             if len(mtrades) == 1:
-                notional = last_trade["price"] * last_trade["size"]
-                if notional >= 200:
-                    late_total += 1
-                    if outcome == win_outcome:
-                        late_wins += 1
+                single_entry_markets += 1
+            else:
+                multi_entry_markets += 1
         
-        if late_total >= 5:
-            single_bet_wr = late_wins / late_total
-            if single_bet_wr >= 0.90:
-                score = min(1.0, (single_bet_wr - 0.70) / 0.30) * 0.3
-                suspicion_score += score
-                signals.append("DECISIVE_SINGLE_BETS")
-                evidence.append({
-                    "pattern": "DECISIVE_SINGLE_BETS",
-                    "detail": f"{late_wins}/{late_total} single-bet markets won ({single_bet_wr:.0%}), $200+ each",
-                    "score_contribution": round(score, 4),
-                })
+        single_entry_pct = single_entry_markets / len(market_groups) if market_groups else 0
         
-        # ---- Flag if suspicion score is significant ----
-        if suspicion_score >= 0.15 and len(signals) >= 1:
-            # Calculate total volume for context
-            total_volume = sum(t["price"] * t["size"] for t in wtrades)
+        conviction_score = 0
+        if single_entry_pct >= 0.90:
+            conviction_score = 1.0
+        elif single_entry_pct >= 0.75:
+            conviction_score = 0.6
+        elif single_entry_pct >= 0.60:
+            conviction_score = 0.3
+        
+        # ---- SIGNAL 4: High win rate on resolved markets ----
+        resolved_wins = 0
+        resolved_total = 0
+        resolved_details = []
+        
+        for cid, mtrades in market_groups.items():
+            # Check if market has resolution data
+            win_outcome = None
+            for t in mtrades:
+                wo = (t.get("winning_outcome") or "").lower()
+                if wo:
+                    win_outcome = wo
+                    break
             
-            flagged.append({
-                "wallet": wallet,
-                "display_name": wallet[:12] + "...",
-                "suspicion_score": round(suspicion_score, 4),
-                "signals": signals,
-                "evidence": evidence,
-                "total_trades": len(wtrades),
-                "distinct_markets": len(market_groups),
-                "total_volume": round(total_volume, 2),
-                "flagged_at": datetime.utcnow().isoformat(),
+            if not win_outcome:
+                continue
+            
+            resolved_total += 1
+            
+            # Determine wallet's position (last trade direction)
+            last_trade = sorted(mtrades, key=lambda t: t.get("timestamp", 0))[-1]
+            outcome = (last_trade.get("outcome") or "").lower()
+            side = last_trade["side"]
+            notional = market_notionals.get(cid, 0)
+            title = last_trade.get("title", cid[:20])
+            
+            won = (outcome == win_outcome)
+            if won:
+                resolved_wins += 1
+            
+            resolved_details.append({
+                "market": cid,
+                "title": title[:60],
+                "side": side,
+                "outcome": outcome,
+                "won": won,
+                "notional": round(notional, 2),
             })
+        
+        if resolved_total < 5:
+            continue
+        
+        win_rate = resolved_wins / resolved_total
+        
+        winrate_score = 0
+        if win_rate >= 0.95:
+            winrate_score = 1.0
+        elif win_rate >= 0.90:
+            winrate_score = 0.8
+        elif win_rate >= 0.85:
+            winrate_score = 0.5
+        elif win_rate >= 0.75:
+            winrate_score = 0.2
+        
+        if winrate_score == 0:
+            continue
+        
+        # ---- SIGNAL 5: No hedging (never takes both sides) ----
+        hedged_markets = 0
+        for cid, mtrades in market_groups.items():
+            sides = set()
+            for t in mtrades:
+                sides.add(t["side"].upper())
+            if len(sides) > 1:
+                hedged_markets += 1
+        
+        hedge_pct = hedged_markets / len(market_groups) if market_groups else 0
+        
+        no_hedge_score = 0
+        if hedge_pct == 0:
+            no_hedge_score = 1.0
+        elif hedge_pct <= 0.05:
+            no_hedge_score = 0.7
+        elif hedge_pct <= 0.15:
+            no_hedge_score = 0.3
+        # More than 15% hedged — looks like a trader, not insider
+        
+        # ---- SIGNAL 6: Short duration market preference ----
+        # Approximate by checking if trades cluster in time
+        # (short-duration markets = wallet trades on markets that resolve quickly)
+        # We estimate by looking at the spread of trade timestamps per market
+        short_duration_markets = 0
+        for cid, mtrades in market_groups.items():
+            ts_list = [t.get("timestamp", 0) for t in mtrades if t.get("timestamp", 0) > 0]
+            if not ts_list:
+                continue
+            # If all trades in a market happen within 7 days, likely a short-duration market
+            spread_days = (max(ts_list) - min(ts_list)) / 86400
+            if spread_days <= 7:
+                short_duration_markets += 1
+        
+        short_pct = short_duration_markets / len(market_groups) if market_groups else 0
+        
+        short_duration_score = 0
+        if short_pct >= 0.80:
+            short_duration_score = 1.0
+        elif short_pct >= 0.60:
+            short_duration_score = 0.6
+        elif short_pct >= 0.40:
+            short_duration_score = 0.3
+        
+        # ---- COMPOSITE SUSPICION SCORE ----
+        # Weighted: win rate and conviction matter most
+        suspicion_score = (
+            0.10 * young_score +           # Young wallet
+            0.10 * size_score +             # High bet size
+            0.15 * conviction_score +       # Single entry conviction
+            0.30 * winrate_score +           # Win rate (most important)
+            0.15 * no_hedge_score +          # No hedging
+            0.20 * short_duration_score      # Short duration preference
+        )
+        
+        # Classify tier
+        if suspicion_score >= 0.7:
+            tier = "HIGHLY_SUSPICIOUS"
+        elif suspicion_score >= 0.4:
+            tier = "SUSPICIOUS"
+        elif suspicion_score >= 0.2:
+            tier = "WATCHLIST"
+        else:
+            continue
+        
+        # Build evidence summary
+        evidence = {
+            "wallet_age_days": round(wallet_age_days, 1),
+            "avg_bet_size": round(avg_market_size, 2),
+            "single_entry_pct": round(single_entry_pct, 4),
+            "win_rate": round(win_rate, 4),
+            "resolved_markets": resolved_total,
+            "resolved_wins": resolved_wins,
+            "hedge_pct": round(hedge_pct, 4),
+            "short_duration_pct": round(short_pct, 4),
+        }
+        
+        scores_breakdown = {
+            "young_wallet": round(young_score, 2),
+            "bet_size": round(size_score, 2),
+            "conviction": round(conviction_score, 2),
+            "win_rate": round(winrate_score, 2),
+            "no_hedge": round(no_hedge_score, 2),
+            "short_duration": round(short_duration_score, 2),
+        }
+        
+        # Top wins for display
+        top_wins = sorted(
+            [d for d in resolved_details if d["won"]],
+            key=lambda x: x["notional"],
+            reverse=True
+        )[:5]
+        
+        # Top losses for context
+        losses = [d for d in resolved_details if not d["won"]]
+        
+        flagged.append({
+            "wallet": wallet,
+            "display_name": wallet[:12] + "...",
+            "suspicion_score": round(suspicion_score, 4),
+            "tier": tier,
+            "evidence": evidence,
+            "scores": scores_breakdown,
+            "total_trades": len(wtrades),
+            "distinct_markets": len(market_groups),
+            "total_volume": round(total_volume, 2),
+            "first_trade": first_trade_ts,
+            "last_trade": last_trade_ts,
+            "top_wins": top_wins,
+            "losses": losses[:3],
+            "flagged_at": datetime.utcnow().isoformat(),
+        })
     
     # Sort by suspicion score
     flagged.sort(key=lambda x: x["suspicion_score"], reverse=True)
     
-    logger.info(f"Conviction detector: {len(flagged)} wallets flagged out of {len(wallet_trades)}")
+    # Count tiers
+    tier_counts = defaultdict(int)
+    for f in flagged:
+        tier_counts[f["tier"]] += 1
+    
+    logger.info(f"Burner wallet detector: {len(flagged)} flagged out of {len(wallet_trades)}")
+    logger.info(f"  Tiers: {dict(tier_counts)}")
     if flagged:
         for f in flagged[:5]:
-            logger.info(f"  {f['wallet'][:12]}... score={f['suspicion_score']:.3f} signals={f['signals']}")
+            logger.info(
+                f"  {f['wallet'][:12]}... tier={f['tier']} score={f['suspicion_score']:.3f} "
+                f"age={f['evidence']['wallet_age_days']:.0f}d wr={f['evidence']['win_rate']:.0%} "
+                f"avg=${f['evidence']['avg_bet_size']:,.0f} vol=${f['total_volume']:,.0f}"
+            )
     
     return flagged
 
