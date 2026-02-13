@@ -2912,6 +2912,40 @@ def backfill_status():
     }
 
 
+@app.get("/api/live_trades/stats")
+def live_trades_stats():
+    """Get live_trades table stats."""
+    if not DATABASE_URL:
+        return {"error": "No database configured"}
+    try:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM live_trades")
+        count = cur.fetchone()[0]
+        cur.execute("SELECT pg_size_pretty(pg_total_relation_size('live_trades'))")
+        size = cur.fetchone()[0]
+        cur.execute("SELECT MIN(timestamp), MAX(timestamp) FROM live_trades")
+        min_ts, max_ts = cur.fetchone()
+        conn.close()
+        return {
+            "row_count": count,
+            "table_size": size,
+            "oldest_timestamp": min_ts,
+            "newest_timestamp": max_ts,
+            "retention_days": LIVE_TRADES_RETENTION_DAYS,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/live_trades/cleanup")
+def trigger_retention_cleanup():
+    """Manually trigger retention cleanup."""
+    thread = threading.Thread(target=run_retention_cleanup, daemon=True)
+    thread.start()
+    return {"status": "started", "message": f"Retention cleanup running (deleting rows older than {LIVE_TRADES_RETENTION_DAYS} days)"}
+
+
 # ================================================================
 # BACKTESTING ENGINE
 # ================================================================
@@ -3476,6 +3510,57 @@ def dashboard():
 
 
 # ================================================================
+# RETENTION POLICY
+# ================================================================
+
+LIVE_TRADES_RETENTION_DAYS = 180  # 6 months
+
+def run_retention_cleanup():
+    """Delete live_trades older than retention window and log results."""
+    if not DATABASE_URL:
+        return
+    try:
+        conn = db_conn()
+        conn.autocommit = True
+        cur = conn.cursor()
+
+        # Get count before cleanup
+        cur.execute("SELECT COUNT(*) FROM live_trades")
+        before_count = cur.fetchone()[0]
+
+        if before_count == 0:
+            logger.info("Retention cleanup: live_trades is empty, nothing to do")
+            conn.close()
+            return
+
+        # Delete rows older than retention window (timestamp is epoch bigint)
+        cutoff_epoch = int(time.time()) - (LIVE_TRADES_RETENTION_DAYS * 86400)
+        cur.execute("DELETE FROM live_trades WHERE timestamp < %s", (cutoff_epoch,))
+        deleted = cur.rowcount
+
+        # Get count after cleanup
+        cur.execute("SELECT COUNT(*) FROM live_trades")
+        after_count = cur.fetchone()[0]
+
+        # Reclaim disk space if we deleted a significant amount
+        if deleted > 10000:
+            logger.info(f"Retention: running VACUUM on live_trades after deleting {deleted} rows...")
+            cur.execute("VACUUM live_trades")
+
+        # Log table size
+        cur.execute("SELECT pg_size_pretty(pg_total_relation_size('live_trades'))")
+        table_size = cur.fetchone()[0]
+
+        conn.close()
+        logger.info(
+            f"Retention cleanup complete: {before_count} → {after_count} rows "
+            f"({deleted} deleted), table size: {table_size}"
+        )
+    except Exception as e:
+        logger.error(f"Retention cleanup failed: {e}")
+
+
+# ================================================================
 # STARTUP
 # ================================================================
 
@@ -3487,14 +3572,24 @@ def background_pipeline():
     except Exception as e:
         logger.error(f"Database init failed: {e}")
 
+    # Run retention cleanup on startup
+    run_retention_cleanup()
+
     # Initial run
     run_pipeline()
 
-    # Schedule refreshes every 12 hours
+    # Schedule refreshes every 1 hour, retention cleanup every 24 hours
+    cycles = 0
     while True:
         time.sleep(1 * 3600)  # 1 hour
+        cycles += 1
         logger.info("Running scheduled refresh...")
         run_pipeline()
+
+        # Run retention cleanup once per day (every 24 cycles)
+        if cycles % 24 == 0:
+            logger.info("Running nightly retention cleanup...")
+            run_retention_cleanup()
 
 
 # Start pipeline in background thread
