@@ -540,9 +540,27 @@ class LiveTradeListener:
         while self.running:
             try:
                 self._poll_once()
+                self._consecutive_errors = 0
             except Exception as e:
                 self.errors += 1
+                self._consecutive_errors = getattr(self, '_consecutive_errors', 0) + 1
                 logger.error(f"Poll error: {e}")
+
+                # If we've failed 10+ times in a row, skip ahead to current block
+                # This recovers from being stuck on a bad block range
+                if self._consecutive_errors >= 10:
+                    try:
+                        current = self.w3.eth.block_number
+                        old_block = self.last_block
+                        self.last_block = current - 10  # start fresh, ~20 seconds ago
+                        self._consecutive_errors = 0
+                        logger.warning(
+                            f"Skipping ahead after {10} consecutive errors: "
+                            f"block {old_block} → {self.last_block} (current: {current})"
+                        )
+                    except Exception:
+                        pass
+
                 time.sleep(min(self.poll_interval * 2, 60))
 
             time.sleep(self.poll_interval)
