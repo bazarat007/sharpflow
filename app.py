@@ -2242,11 +2242,24 @@ def run_pipeline():
 
         # Step 3: Score wallets
         scored = score_all_wallets(trades, markets_lookup)
+
+        # Seed the live scoring cache with batch results
+        # This is the source of truth for "who is sharp"
+        with live_wallet_scores_lock:
+            for w in scored:
+                w["source"] = "batch"
+                live_wallet_scores[w["wallet"]] = w
+            logger.info(f"Seeded live scoring cache with {len(scored)} batch-scored wallets")
+
         state["scored_wallets"] = scored
 
         # Step 4: Detect convergence
         signals = detect_convergence(scored, trades)
-        state["convergence_signals"] = signals
+
+        # Merge batch convergence with any live convergence signals
+        live_signals = [s for s in live_convergence_signals if s.get("source") == "live"]
+        all_signals = signals + live_signals
+        state["convergence_signals"] = all_signals
 
         # Step 5: Compute market intelligence (also collects whale positions)
         intel, whale_positions = compute_market_intelligence(scored)
@@ -2950,14 +2963,17 @@ def trigger_retention_cleanup():
 def get_live_scoring_status():
     """Get live event-driven scoring stats."""
     with live_wallet_scores_lock:
-        sharp_count = sum(1 for s in live_wallet_scores.values() if s["tier"] == "sharp")
+        sharp_count = sum(1 for s in live_wallet_scores.values() if s.get("sharpness_score", 0) >= 0.38)
         total_scored = len(live_wallet_scores)
         convergence_count = len(live_convergence_signals)
+        batch_count = sum(1 for s in live_wallet_scores.values() if s.get("source") == "batch")
     return {
         **live_scoring_stats,
         "wallets_tracked": total_scored,
+        "batch_scored_wallets": batch_count,
         "sharp_wallets": sharp_count,
         "live_convergence_signals": convergence_count,
+        "convergence_details": live_convergence_signals[:10],
     }
 
 
@@ -3824,8 +3840,17 @@ def check_live_convergence(condition_id):
 
 
 def on_live_trades(trades_batch):
-    """Callback from live listener. Scores affected wallets and checks convergence.
-    Called after each poll batch with list of inserted trade dicts."""
+    """Callback from live listener. Uses batch-scored wallet data to detect
+    real-time convergence when sharp wallets trade on open markets.
+    
+    Flow:
+    1. Trade comes in → check if wallet is already scored (from batch pipeline)
+    2. If wallet is sharp → check if this market now has convergence
+    3. Update dashboard state with any new signals
+    
+    The batch pipeline provides the "who is sharp" baseline.
+    The live pipeline provides the "what are they doing right now" signals.
+    """
 
     if not trades_batch:
         return
@@ -3834,83 +3859,32 @@ def on_live_trades(trades_batch):
     live_scoring_stats["last_trade_time"] = datetime.utcnow().isoformat()
 
     # Collect unique wallets and markets from this batch
-    affected_wallets = set()
     affected_markets = set()
-    for t in trades_batch:
-        affected_wallets.add(t["wallet"])
-        cid = t.get("condition_id", "")
-        if cid:
-            affected_markets.add(cid)
+    sharp_trades_in_batch = 0
 
-    # Re-score each affected wallet
-    for wallet in affected_wallets:
-        try:
-            # Get all trades for this wallet (from both live_trades AND historical trades table)
-            live_trades = db_get_live_trades_for_wallet(wallet, months_back=SCORING_WINDOW_MONTHS)
-
-            # Also pull from historical trades table for resolved market data
-            hist_trades = []
-            try:
-                conn = db_conn()
-                cur = conn.cursor(cursor_factory=RealDictCursor)
-                cutoff = int((datetime.utcnow() - timedelta(days=SCORING_WINDOW_MONTHS * 30)).timestamp())
-                cur.execute("""
-                    SELECT wallet, condition_id, side, outcome, price, size,
-                           timestamp, title, category, winning_outcome
-                    FROM trades
-                    WHERE wallet = %s AND timestamp > %s
-                """, (wallet, cutoff))
-                hist_trades = [dict(r) for r in cur.fetchall()]
-                cur.close()
-                conn.close()
-            except Exception:
-                pass
-
-            # Merge: historical trades have winning_outcome, live trades may not
-            # Deduplicate by (wallet, condition_id, timestamp, side, price)
-            all_trades = list(hist_trades)
-            existing_sigs = set()
-            for t in hist_trades:
-                sig = (t["wallet"], t["condition_id"], t.get("timestamp", 0), t["side"], t["price"])
-                existing_sigs.add(sig)
-
-            for t in live_trades:
-                sig = (t["wallet"], t["condition_id"], t.get("timestamp", 0), t["side"], t["price"])
-                if sig not in existing_sigs:
-                    all_trades.append(t)
-                    existing_sigs.add(sig)
-
-            if not all_trades:
+    with live_wallet_scores_lock:
+        for t in trades_batch:
+            wallet = t["wallet"]
+            cid = t.get("condition_id", "")
+            if not cid:
                 continue
 
-            score = score_single_wallet(wallet, all_trades)
-            if score:
-                with live_wallet_scores_lock:
-                    live_wallet_scores[wallet] = score
-                live_scoring_stats["wallets_rescored"] += 1
+            # Check if this wallet is known sharp (from batch scoring)
+            wallet_score = live_wallet_scores.get(wallet)
+            if wallet_score and wallet_score.get("sharpness_score", 0) >= 0.38:
+                affected_markets.add(cid)
+                sharp_trades_in_batch += 1
 
-                # Update the main state scored_wallets if this wallet is sharp
-                if score["tier"] == "sharp" and state.get("scored_wallets"):
-                    # Update or add to the main scored wallets list
-                    existing = next((w for w in state["scored_wallets"] if w["wallet"] == wallet), None)
-                    if existing:
-                        existing.update(score)
-                    else:
-                        score["rank"] = len(state["scored_wallets"]) + 1
-                        state["scored_wallets"].append(score)
+    if sharp_trades_in_batch > 0:
+        live_scoring_stats["wallets_rescored"] += sharp_trades_in_batch
 
-        except Exception as e:
-            live_scoring_stats["errors"] += 1
-            logger.error(f"Live scoring error for {wallet[:10]}: {e}")
-
-    # Check convergence for affected markets
+    # Check convergence for markets where sharp wallets just traded
     for cid in affected_markets:
         try:
             signals = check_live_convergence(cid)
             if signals:
                 live_scoring_stats["convergence_checks"] += 1
                 with live_wallet_scores_lock:
-                    # Merge with existing live convergence signals
                     # Remove old signals for this market, add new ones
                     live_convergence_signals[:] = [
                         s for s in live_convergence_signals if s["market_id"] != cid
@@ -3918,7 +3892,6 @@ def on_live_trades(trades_batch):
 
                 # Also update main state convergence signals
                 if state.get("convergence_signals") is not None:
-                    # Remove old live signals for this market
                     state["convergence_signals"] = [
                         s for s in state["convergence_signals"]
                         if not (s.get("market_id") == cid and s.get("source") == "live")
