@@ -17,6 +17,7 @@ Environment variables needed:
 import os
 import json
 import time
+import math
 import logging
 import threading
 from datetime import datetime, timedelta
@@ -1457,11 +1458,15 @@ def detect_convergence(scored_wallets, trades):
             agreement = combined_score / (combined_score + opp_score) if (combined_score + opp_score) > 0 else 1.0
 
             # Strength formula: wallet diversity + combined sharpness + agreement + money committed
+            # Batch signals don't have exact entry timestamps, so freshness defaults to 0.5
+            freshness = 0.5  # unknown entry time from batch positions
+
             strength = (
-                0.25 * min(1, len(unique_wallets) / 5) +    # More independent wallets = stronger
-                0.25 * min(1, combined_score / 2.5) +        # Higher combined sharpness = stronger
-                0.25 * agreement +                            # Less opposition = stronger
-                0.25 * min(1, total_notional / 5000)          # More money committed = stronger
+                0.20 * min(1, len(unique_wallets) / 5) +    # More independent wallets = stronger
+                0.20 * min(1, combined_score / 2.5) +        # Higher combined sharpness = stronger
+                0.20 * agreement +                            # Less opposition = stronger
+                0.20 * min(1, total_notional / 5000) +        # More money committed = stronger
+                0.20 * freshness                              # Freshness (unknown for batch)
             )
 
             if sharp_count >= 5 and len(unique_wallets) >= 6:
@@ -1488,7 +1493,12 @@ def detect_convergence(scored_wallets, trades):
                 "total_size": round(total_size, 2),
                 "total_notional": round(total_notional, 2),
                 "market_price": round(mid_price, 3),
+                "freshness": freshness,
+                "avg_age_hours": None,
+                "earliest_entry": None,
+                "latest_entry": None,
                 "wallets": sorted(unique_wallets, key=lambda w: w["sharpness_score"], reverse=True)[:10],
+                "source": "batch",
             })
 
     # Deduplicate signals from related markets (same wallets, similar titles)
@@ -3762,6 +3772,7 @@ def check_live_convergence(condition_id):
             "size": t["size"],
             "price": t["price"],
             "notional": round(notional, 2),
+            "entry_time": t.get("timestamp", 0),
         }
 
         side = t["side"].upper()
@@ -3804,11 +3815,32 @@ def check_live_convergence(condition_id):
         sharp_count = sum(1 for w in unique if w["tier"] == "sharp")
         total_size = sum(w["size"] for w in unique)
 
+        # Signal decay: compute freshness from entry timestamps
+        now_epoch = int(time.time())
+        entry_times = [w.get("entry_time", 0) for w in unique if w.get("entry_time", 0) > 0]
+        if entry_times:
+            earliest_entry = min(entry_times)
+            latest_entry = max(entry_times)
+            avg_age_seconds = now_epoch - (sum(entry_times) / len(entry_times))
+            avg_age_hours = avg_age_seconds / 3600
+
+            # Freshness: 1.0 = just entered, decays to 0 over 72 hours (half-life ~24h)
+            # Using exponential decay: freshness = e^(-age / half_life)
+            half_life_hours = 24
+            freshness = math.exp(-avg_age_hours * math.log(2) / half_life_hours)
+            freshness = round(max(0, min(1, freshness)), 4)
+        else:
+            earliest_entry = 0
+            latest_entry = 0
+            avg_age_hours = 0
+            freshness = 0.5  # unknown age, assume mid
+
         strength = (
-            0.25 * min(1, len(unique) / 5) +
-            0.25 * min(1, combined_score / 2.5) +
-            0.25 * agreement +
-            0.25 * min(1, total_notional / 5000)
+            0.20 * min(1, len(unique) / 5) +
+            0.20 * min(1, combined_score / 2.5) +
+            0.20 * agreement +
+            0.20 * min(1, total_notional / 5000) +
+            0.20 * freshness  # fresh signals are stronger
         )
 
         if sharp_count >= 5 and len(unique) >= 6:
@@ -3831,6 +3863,10 @@ def check_live_convergence(condition_id):
             "agreement_ratio": round(agreement, 4),
             "total_size": round(total_size, 2),
             "total_notional": round(total_notional, 2),
+            "freshness": freshness,
+            "avg_age_hours": round(avg_age_hours, 1),
+            "earliest_entry": earliest_entry,
+            "latest_entry": latest_entry,
             "wallets": sorted(unique, key=lambda w: w["sharpness_score"], reverse=True)[:10],
             "source": "live",
             "detected_at": datetime.utcnow().isoformat(),
