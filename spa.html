@@ -1,328 +1,666 @@
 <!DOCTYPE html>
-<html><head>
+<html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SharpFlow</title>
-<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
-<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
-<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
-<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
+:root {
+  --bg-root: #06090e;
+  --bg-surface: #0b1017;
+  --bg-card: #0f151d;
+  --bg-elevated: #141c28;
+  --border: #1a2536;
+  --border-active: #2a3a52;
+  --text-primary: #e4eaf2;
+  --text-secondary: #7a8da6;
+  --text-muted: #3d5068;
+  --accent-green: #00e09e;
+  --accent-green-dim: rgba(0,224,158,.08);
+  --accent-purple: #8b5cf6;
+  --accent-purple-dim: rgba(139,92,246,.08);
+  --accent-amber: #f0a830;
+  --accent-amber-dim: rgba(240,168,48,.08);
+  --accent-red: #ef4444;
+  --accent-red-dim: rgba(239,68,68,.08);
+  --accent-blue: #3b82f6;
+  --accent-blue-dim: rgba(59,130,246,.08);
+  --font: 'Outfit', -apple-system, system-ui, sans-serif;
+  --mono: 'JetBrains Mono', monospace;
+  --radius: 10px;
+  --radius-sm: 6px;
+}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#060d14;color:#c5d0de;font-family:'DM Sans',-apple-system,system-ui,sans-serif}
-@keyframes fadeIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
-::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:#060d14}::-webkit-scrollbar-thumb{background:#1a2a3a;border-radius:3px}
-.mono{font-family:'JetBrains Mono',monospace}
+body{background:var(--bg-root);color:var(--text-secondary);font-family:var(--font);-webkit-font-smoothing:antialiased;min-height:100vh}
+::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:var(--bg-root)}::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+
+/* Animations */
+@keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+@keyframes liveDot{0%,100%{box-shadow:0 0 0 0 rgba(0,224,158,.5)}70%{box-shadow:0 0 0 6px rgba(0,224,158,0)}}
+@keyframes shimmer{0%{background-position:-200% 0}100%{background-position:200% 0}}
+@keyframes slideIn{from{opacity:0;transform:translateX(-12px)}to{opacity:1;transform:translateX(0)}}
+.fade-up{animation:fadeUp .4s ease both}
+.fade-in{animation:fadeIn .3s ease both}
+
+/* Utility */
+.mono{font-family:var(--mono)}
+.container{max-width:1140px;margin:0 auto;padding:0 20px}
+
+/* Header */
+.header{padding:16px 0;border-bottom:1px solid var(--border)}
+.header-inner{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px}
+.logo{font-family:var(--mono);font-weight:800;font-size:17px;color:var(--text-primary);letter-spacing:-.3px}
+.logo span{color:var(--accent-green)}
+.system-pulse{display:flex;align-items:center;gap:10px;background:var(--bg-surface);border:1px solid var(--border);border-radius:20px;padding:5px 14px 5px 10px}
+.live-dot{width:7px;height:7px;border-radius:50%;background:var(--accent-green);animation:liveDot 1.8s infinite}
+.pulse-label{font-family:var(--mono);font-size:10px;font-weight:600;color:var(--accent-green);letter-spacing:.5px}
+.pulse-sep{width:1px;height:12px;background:var(--border)}
+.pulse-stat{font-family:var(--mono);font-size:10px;color:var(--text-muted)}
+.pulse-stat b{color:var(--text-secondary);font-weight:600}
+
+/* Nav */
+.nav{display:flex;gap:2px;padding:12px 0;border-bottom:1px solid var(--border)}
+.nav-btn{background:none;border:none;color:var(--text-muted);font-family:var(--font);font-size:12.5px;font-weight:600;padding:7px 16px;border-radius:6px;cursor:pointer;transition:all .15s;position:relative}
+.nav-btn:hover{color:var(--text-secondary);background:var(--bg-surface)}
+.nav-btn.active{color:var(--text-primary);background:var(--bg-elevated)}
+.nav-btn .count{font-family:var(--mono);font-size:9px;color:var(--text-muted);margin-left:4px;font-weight:500}
+.nav-btn.active .count{color:var(--accent-green)}
+
+/* Cards */
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;transition:border-color .2s}
+.card:hover{border-color:var(--border-active)}
+.card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
+.card-title{font-size:11px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase}
+.card-badge{font-family:var(--mono);font-size:9px;font-weight:600;padding:3px 8px;border-radius:4px;letter-spacing:.5px}
+
+/* Summary grid */
+.summary-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:16px 0}
+@media(max-width:640px){.summary-grid{grid-template-columns:1fr}}
+
+/* Signal card (hero) */
+.signal-hero{border-color:var(--accent-purple);border-color:rgba(139,92,246,.2);background:linear-gradient(135deg, var(--bg-card) 0%, rgba(139,92,246,.03) 100%)}
+.signal-hero .direction{font-family:var(--mono);font-size:28px;font-weight:800;line-height:1}
+.signal-hero .direction.yes{color:var(--accent-green)}
+.signal-hero .direction.no{color:var(--accent-red)}
+.signal-market{font-size:14px;font-weight:700;color:var(--text-primary);margin-bottom:4px;line-height:1.3}
+.signal-meta{font-size:11px;color:var(--text-muted);display:flex;gap:12px;flex-wrap:wrap}
+.signal-meta span{display:flex;align-items:center;gap:4px}
+
+/* Kelly box */
+.kelly-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--border);border-radius:var(--radius-sm);overflow:hidden;margin-top:14px}
+.kelly-cell{background:var(--bg-surface);padding:10px;text-align:center}
+.kelly-cell .val{font-family:var(--mono);font-size:15px;font-weight:700;color:var(--text-primary)}
+.kelly-cell .lbl{font-size:9px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.8px;margin-top:2px}
+
+/* Activity feed */
+.feed-item{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--border)}
+.feed-item:last-child{border-bottom:none}
+.feed-dot{width:5px;height:5px;border-radius:50%;flex-shrink:0}
+.feed-dot.fresh{background:var(--accent-green);animation:pulse 2s infinite}
+.feed-dot.stale{background:var(--text-muted)}
+.feed-time{font-family:var(--mono);font-size:10px;color:var(--text-muted);width:48px;flex-shrink:0}
+.feed-wallet{font-family:var(--mono);font-size:10px;color:var(--accent-purple);width:80px;flex-shrink:0;overflow:hidden;text-overflow:ellipsis}
+.feed-side{font-family:var(--mono);font-size:10px;font-weight:700;width:32px;flex-shrink:0}
+.feed-side.buy{color:var(--accent-green)}
+.feed-side.sell{color:var(--accent-red)}
+.feed-market{font-size:11px;color:var(--text-secondary);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.feed-size{font-family:var(--mono);font-size:10px;color:var(--text-muted);flex-shrink:0}
+
+/* Alert badges */
+.alerts-row{display:flex;gap:8px;flex-wrap:wrap}
+.alert-chip{display:flex;align-items:center;gap:6px;background:var(--bg-surface);border:1px solid var(--border);border-radius:20px;padding:6px 12px;font-size:11px;color:var(--text-secondary);cursor:pointer;transition:all .15s}
+.alert-chip:hover{border-color:var(--border-active);background:var(--bg-elevated)}
+.alert-chip .n{font-family:var(--mono);font-weight:700;font-size:11px}
+.alert-chip.green .n{color:var(--accent-green)}
+.alert-chip.purple .n{color:var(--accent-purple)}
+.alert-chip.amber .n{color:var(--accent-amber)}
+.alert-chip.red .n{color:var(--accent-red)}
+
+/* Strength/freshness bars */
+.bar-track{height:3px;background:var(--bg-surface);border-radius:2px;overflow:hidden;flex:1}
+.bar-fill{height:100%;border-radius:2px;transition:width .4s ease}
+.bar-fill.green{background:var(--accent-green)}
+.bar-fill.purple{background:var(--accent-purple)}
+.bar-fill.amber{background:var(--accent-amber)}
+
+/* Tables */
+.table-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{font-size:10px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.8px;text-align:left;padding:10px 12px;border-bottom:1px solid var(--border)}
+td{padding:10px 12px;border-bottom:1px solid var(--border);color:var(--text-secondary)}
+tr:hover td{background:var(--bg-surface)}
+
+/* Tier badges */
+.tier{font-family:var(--mono);font-size:9px;font-weight:700;padding:2px 7px;border-radius:3px;letter-spacing:.3px}
+.tier.elite{background:rgba(0,224,158,.12);color:var(--accent-green)}
+.tier.sharp{background:rgba(139,92,246,.12);color:var(--accent-purple)}
+.tier.average{background:rgba(122,141,166,.1);color:var(--text-muted)}
+.tier.dull{background:rgba(239,68,68,.08);color:#888}
+.tier.highly_suspicious{background:rgba(239,68,68,.12);color:var(--accent-red)}
+.tier.suspicious{background:rgba(240,168,48,.12);color:var(--accent-amber)}
+.tier.watchlist{background:rgba(59,130,246,.1);color:var(--accent-blue)}
+
+/* Market intel card */
+.intel-card{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-sm);padding:14px;margin-bottom:8px;transition:border-color .15s}
+.intel-card:hover{border-color:var(--border-active)}
+.intel-title{font-size:13px;font-weight:600;color:var(--text-primary);margin-bottom:8px}
+.intel-row{display:flex;justify-content:space-between;align-items:center;gap:12px;font-size:11px}
+.intel-label{color:var(--text-muted);font-size:10px}
+.divergence-bar{display:flex;align-items:center;gap:6px}
+
+/* Empty state */
+.empty{text-align:center;padding:40px 20px;color:var(--text-muted);font-size:13px}
+.empty .icon{font-size:28px;margin-bottom:8px}
+
+/* Sections for tabs */
+.tab-content{display:none;animation:fadeUp .3s ease both}
+.tab-content.active{display:block}
+
+/* Suspicious evidence */
+.evidence-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--border);border-radius:var(--radius-sm);overflow:hidden;margin:8px 0}
+.evidence-cell{background:var(--bg-surface);padding:8px;text-align:center}
+.evidence-cell .val{font-family:var(--mono);font-size:13px;font-weight:700}
+.evidence-cell .lbl{font-size:8px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.8px;margin-top:1px}
+
+/* Loading skeleton */
+.skeleton{background:linear-gradient(90deg,var(--bg-surface) 25%,var(--bg-elevated) 50%,var(--bg-surface) 75%);background-size:200% 100%;animation:shimmer 1.5s infinite;border-radius:4px;height:16px}
 </style>
-</head><body>
-<div id="root"></div>
-<script type="text/babel">
-const {useState,useEffect,useCallback}=React;
+</head>
+<body>
 
-function useApi(ep,interval=60000){
-  const[data,setData]=useState(null);
-  const fd=useCallback(async()=>{try{const r=await fetch(ep);setData(await r.json())}catch(e){}},[ep]);
-  useEffect(()=>{fd();const id=setInterval(fd,interval);return()=>clearInterval(id)},[fd,interval]);
-  return data;
-}
+<div class="header">
+  <div class="container header-inner">
+    <div class="logo">SHARP<span>FLOW</span></div>
+    <div class="system-pulse" id="systemPulse">
+      <div class="live-dot" id="liveDot"></div>
+      <span class="pulse-label">LIVE</span>
+      <div class="pulse-sep"></div>
+      <span class="pulse-stat" id="pulseStats">Loading...</span>
+    </div>
+  </div>
+</div>
 
-const TC={sharp:"#00f5a0",average:"#8a9bb5",dull:"#f54242"};
-const TL={sharp:"\ud83d\udcca SHARP",average:"\u2696\ufe0f AVG",dull:"\u274c DULL"};
-const CE={sports:"\ud83c\udfc0",politics:"\ud83c\udfdb\ufe0f",other:"\ud83d\udcca",nba:"\ud83c\udfc0",nfl:"\ud83c\udfc8",mlb:"\u26be",nhl:"\ud83c\udfd2",soccer:"\u26bd",ufc:"\ud83e\udd4a"};
+<div class="container">
+  <nav class="nav" id="nav">
+    <button class="nav-btn active" data-tab="summary">Summary</button>
+    <button class="nav-btn" data-tab="signals">Signals <span class="count" id="navSignals">0</span></button>
+    <button class="nav-btn" data-tab="markets">Markets <span class="count" id="navMarkets">0</span></button>
+    <button class="nav-btn" data-tab="wallets">Wallets <span class="count" id="navWallets">0</span></button>
+    <button class="nav-btn" data-tab="suspicious">Suspicious <span class="count" id="navSuspicious">0</span></button>
+  </nav>
 
-function Badge({tier}){const c=TC[tier]||"#5a7a9a";return <span style={{background:c+"1e",color:c,padding:"2px 8px",borderRadius:4,fontSize:10,fontWeight:700,whiteSpace:"nowrap"}}>{TL[tier]||tier}</span>}
-function Stat({value,label,color="#5a7a9a"}){return <div style={{background:"#0a1018",border:"1px solid #1a2a3a",borderRadius:8,padding:"12px 8px",textAlign:"center",minWidth:80}}><div className="mono" style={{fontSize:22,fontWeight:800,color}}>{value}</div><div style={{fontSize:9,color:"#3a4a5a",letterSpacing:1.5,marginTop:4,textTransform:"uppercase"}}>{label}</div></div>}
-function Bar({pct,h=6,o=1}){const w=Math.max(2,Math.round(pct*100));return <div style={{display:"flex",height:h,borderRadius:h/2,overflow:"hidden",background:"#111b26"}}><div style={{width:w+"%",background:`rgba(0,245,160,${o})`,transition:"width .5s"}}/><div style={{width:(100-w)+"%",background:`rgba(245,66,66,${o})`,transition:"width .5s"}}/></div>}
+  <!-- ==================== SUMMARY TAB ==================== -->
+  <div class="tab-content active" id="tab-summary" style="padding:16px 0 40px">
 
-function whySummary(w){
-  const parts=[];
-  const cs=w.category_scores||{};
-  const sharpCats=Object.entries(cs).filter(([,v])=>v.tier==="sharp");
-  if(sharpCats.length>0){
-    const best=sharpCats.sort((a,b)=>b[1].sharpness-a[1].sharpness)[0];
-    parts.push(`${CE[best[0]]||""} ${best[0]}: ${best[1].markets}m, ${(best[1].win_rate*100).toFixed(0)}%WR`);
-  }
-  if(w.avg_clv>0.1)parts.push(`entry ${(w.avg_clv*100).toFixed(0)}% below close`);
-  else if(w.avg_clv>0)parts.push(`+${(w.avg_clv*100).toFixed(1)}% CLV`);
-  if(w.total_pnl>1000)parts.push(`$${(w.total_pnl/1000).toFixed(1)}K profit`);
-  else if(w.total_pnl>0)parts.push(`$${w.total_pnl.toFixed(0)} profit`);
-  return parts.join(" \u00b7 ")||`${w.distinct_markets} markets, ${(w.win_rate*100).toFixed(0)}%WR`;
-}
+    <!-- Alert chips row -->
+    <div class="alerts-row" id="alertsRow" style="margin-bottom:16px"></div>
 
-function WalletRow({w,rank}){
-  const[open,setOpen]=useState(false);
-  const[live,setLive]=useState(null);
-  const[ld,setLd]=useState(false);
-  const c=TC[w.tier]||"#5a7a9a",pc=w.total_pnl>=0?"#00f5a0":"#f54242";
-  const ps=w.total_pnl>=0?"+":"",pf=Math.abs(w.total_pnl)>=1e6?`$${(w.total_pnl/1e6).toFixed(1)}M`:`$${Math.abs(w.total_pnl).toLocaleString("en",{maximumFractionDigits:0})}`;
-  const click=async()=>{
-    if(!open&&!live){setLd(true);try{setLive(await(await fetch(`/api/wallets/${w.wallet}/live`)).json())}catch(e){}setLd(false)}
-    setOpen(!open)
+    <div class="summary-grid">
+      <!-- Hero signal card -->
+      <div class="card signal-hero fade-up" id="heroSignal" style="grid-column:1/-1">
+        <div class="card-header">
+          <span class="card-title" style="color:var(--accent-purple)">🎯 Top Signal</span>
+          <span class="card-badge" style="background:var(--accent-purple-dim);color:var(--accent-purple)" id="heroSourceBadge">—</span>
+        </div>
+        <div id="heroContent">
+          <div class="empty"><div class="icon">📡</div>No convergence signals — monitoring sharp wallets</div>
+        </div>
+      </div>
+
+      <!-- Sharp activity feed -->
+      <div class="card fade-up" style="animation-delay:.1s">
+        <div class="card-header">
+          <span class="card-title" style="color:var(--accent-green)">⚡ Sharp Activity</span>
+          <span class="card-badge" style="background:var(--accent-green-dim);color:var(--accent-green)" id="sharpTradeCount">0 trades</span>
+        </div>
+        <div id="activityFeed">
+          <div class="empty"><div class="icon">⏳</div>Waiting for live trades...</div>
+        </div>
+      </div>
+
+      <!-- Top market divergence -->
+      <div class="card fade-up" style="animation-delay:.15s">
+        <div class="card-header">
+          <span class="card-title" style="color:var(--accent-amber)">📊 Top Divergence</span>
+          <span class="card-badge" style="background:var(--accent-amber-dim);color:var(--accent-amber)" id="divergenceScore">—</span>
+        </div>
+        <div id="topDivergence">
+          <div class="empty"><div class="icon">📈</div>Loading market intelligence...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== SIGNALS TAB ==================== -->
+  <div class="tab-content" id="tab-signals" style="padding:16px 0 40px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+      <span style="font-size:11px;color:var(--text-muted)">Convergence signals with Kelly criterion sizing</span>
+      <div style="display:flex;align-items:center;gap:8px">
+        <label style="font-size:10px;color:var(--text-muted)">Bankroll $</label>
+        <input type="number" id="bankrollInput" value="1000" style="font-family:var(--mono);font-size:11px;width:70px;background:var(--bg-surface);border:1px solid var(--border);color:var(--text-primary);padding:4px 8px;border-radius:4px">
+      </div>
+    </div>
+    <div id="signalsList"></div>
+  </div>
+
+  <!-- ==================== MARKETS TAB ==================== -->
+  <div class="tab-content" id="tab-markets" style="padding:16px 0 40px">
+    <div style="font-size:11px;color:var(--text-muted);margin-bottom:14px">Markets ranked by sharp-vs-dull money divergence</div>
+    <div id="marketsList"></div>
+  </div>
+
+  <!-- ==================== WALLETS TAB ==================== -->
+  <div class="tab-content" id="tab-wallets" style="padding:16px 0 40px">
+    <div style="font-size:11px;color:var(--text-muted);margin-bottom:14px">Scored wallets ranked by sharpness</div>
+    <div class="table-wrap" id="walletsTable"></div>
+  </div>
+
+  <!-- ==================== SUSPICIOUS TAB ==================== -->
+  <div class="tab-content" id="tab-suspicious" style="padding:16px 0 40px">
+    <div style="font-size:11px;color:var(--text-muted);margin-bottom:14px">Burner wallet insider detection — young wallets with anomalous conviction patterns</div>
+    <div id="suspiciousList"></div>
+  </div>
+</div>
+
+<script>
+const API = '';
+let DATA = {};
+
+// ============================================================
+// DATA FETCHING
+// ============================================================
+async function fetchAll() {
+  const endpoints = {
+    stats: '/api/stats',
+    convergence: '/api/convergence',
+    kelly: `/api/kelly?bankroll=${document.getElementById('bankrollInput')?.value||1000}`,
+    markets: '/api/markets?limit=30',
+    wallets: '/api/wallets?limit=50',
+    suspicious: '/api/suspicious?min_score=0.15',
+    liveScoring: '/api/live_scoring',
+    whales: '/api/whales?min_notional=25000',
   };
-  return <div style={{borderBottom:"1px solid #111b26"}}>
-    <div onClick={click} style={{display:"grid",gridTemplateColumns:"36px 1fr 80px 52px 60px 52px 70px",alignItems:"center",padding:"10px 8px",cursor:"pointer"}}
-      onMouseEnter={e=>e.currentTarget.style.background="#0d1520"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
-      <span className="mono" style={{color:"#3a4a5a",fontSize:12}}>#{rank}</span>
-      <div style={{minWidth:0}}>
-        <div style={{fontSize:13,fontWeight:600,color:"#e8edf2",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{w.display_name}</div>
-        <div style={{display:"flex",alignItems:"center",gap:6,marginTop:2}}>
-          <Badge tier={w.tier}/>
-          <span style={{fontSize:10,color:"#5a7a9a",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{whySummary(w)}</span>
+  const results = await Promise.allSettled(
+    Object.entries(endpoints).map(async ([k,url]) => {
+      const r = await fetch(API + url);
+      return [k, await r.json()];
+    })
+  );
+  results.forEach(r => {
+    if (r.status === 'fulfilled') DATA[r.value[0]] = r.value[1];
+  });
+  render();
+}
+
+// ============================================================
+// RENDER
+// ============================================================
+function render() {
+  renderPulse();
+  renderAlerts();
+  renderHeroSignal();
+  renderActivityFeed();
+  renderTopDivergence();
+  renderNavCounts();
+  renderSignalsTab();
+  renderMarketsTab();
+  renderWalletsTab();
+  renderSuspiciousTab();
+}
+
+// --- System Pulse ---
+function renderPulse() {
+  const s = DATA.stats || {};
+  const ls = DATA.liveScoring || {};
+  const sharp = s.tiers?.sharp || s.tiers?.elite || 0;
+  const total = (s.tiers?.sharp||0) + (s.tiers?.elite||0);
+  const trades = ls.trades_processed || 0;
+  const ready = s.status === 'ready';
+  document.getElementById('liveDot').style.background = ready ? 'var(--accent-green)' : 'var(--accent-amber)';
+  document.getElementById('pulseStats').innerHTML =
+    `<b>${fmt(trades)}</b> trades · <b>${total}</b> sharp · <b>${s.convergence_signals||0}</b> signals`;
+}
+
+// --- Alert Chips ---
+function renderAlerts() {
+  const el = document.getElementById('alertsRow');
+  const chips = [];
+  const conv = DATA.convergence?.total || 0;
+  const susp = DATA.suspicious?.total || 0;
+  const whales = DATA.whales?.total || 0;
+  const live = DATA.liveScoring || {};
+  const liveConv = live.live_convergence_signals || 0;
+  const sharpTrades = live.sharp_trades_detected || 0;
+
+  if (conv > 0) chips.push(`<div class="alert-chip purple" onclick="switchTab('signals')"><span class="n">${conv}</span> convergence signal${conv>1?'s':''}</div>`);
+  if (liveConv > 0) chips.push(`<div class="alert-chip green" onclick="switchTab('signals')"><span class="n">${liveConv}</span> live signal${liveConv>1?'s':''}</div>`);
+  if (susp > 0) chips.push(`<div class="alert-chip red" onclick="switchTab('suspicious')"><span class="n">${susp}</span> suspicious wallet${susp>1?'s':''}</div>`);
+  if (whales > 0) chips.push(`<div class="alert-chip amber" onclick="switchTab('markets')"><span class="n">${whales}</span> whale position${whales>1?'s':''}</div>`);
+  if (sharpTrades > 0) chips.push(`<div class="alert-chip green"><span class="n">${fmt(sharpTrades)}</span> sharp trades detected</div>`);
+  if (chips.length === 0) chips.push(`<div class="alert-chip">System monitoring — no alerts</div>`);
+  el.innerHTML = chips.join('');
+}
+
+// --- Hero Signal ---
+function renderHeroSignal() {
+  const signals = DATA.kelly?.signals || [];
+  const el = document.getElementById('heroContent');
+  const badge = document.getElementById('heroSourceBadge');
+  if (!signals.length) {
+    badge.textContent = 'MONITORING';
+    el.innerHTML = `<div class="empty"><div class="icon">📡</div>No convergence signals detected — monitoring ${DATA.liveScoring?.sharp_wallets||0} sharp wallets across live markets</div>`;
+    return;
+  }
+  const s = signals[0];
+  const k = s.kelly || {};
+  const side = (s.side || 'YES').toUpperCase();
+  const sideClass = side.includes('YES') || side.includes('BUY') ? 'yes' : 'no';
+  badge.textContent = s.signal_type || 'CONVERGENCE';
+  badge.style.background = 'var(--accent-purple-dim)';
+  badge.style.color = 'var(--accent-purple)';
+
+  el.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap">
+      <div style="flex:1;min-width:200px">
+        <div class="signal-market">${esc(s.market||'Unknown Market')}</div>
+        <div class="signal-meta">
+          <span>👛 ${s.wallet_count||0} wallets</span>
+          <span>💪 ${pct(s.strength)} strength</span>
+          ${s.freshness!==undefined?`<span>🕐 ${pct(s.freshness)} fresh</span>`:''}
+          <span>📍 @ ${money(s.market_price)}</span>
+        </div>
+        <div style="display:flex;gap:12px;align-items:center;margin-top:12px">
+          <div style="flex:1">
+            <div style="font-size:9px;color:var(--text-muted);margin-bottom:3px">STRENGTH</div>
+            <div class="bar-track"><div class="bar-fill purple" style="width:${(s.strength||0)*100}%"></div></div>
+          </div>
+          ${s.freshness!==undefined ? `<div style="flex:1">
+            <div style="font-size:9px;color:var(--text-muted);margin-bottom:3px">FRESHNESS</div>
+            <div class="bar-track"><div class="bar-fill green" style="width:${(s.freshness||0)*100}%"></div></div>
+          </div>` : ''}
         </div>
       </div>
-      <div className="mono" style={{textAlign:"right",fontSize:18,fontWeight:800,color:c}}>{(w.sharpness_score*100).toFixed(0)}</div>
-      <div className="mono" style={{textAlign:"right",fontSize:12,color:"#00d4ff"}}>{w.avg_clv>=0?"+":""}{w.avg_clv.toFixed(3)}</div>
-      <div className="mono" style={{textAlign:"right",fontSize:12}}>{(w.win_rate*100).toFixed(0)}%</div>
-      <div style={{textAlign:"right",fontSize:11,color:"#5a7a9a"}}>{w.distinct_markets}</div>
-      <div className="mono" style={{textAlign:"right",fontSize:12,color:pc}}>{ps}{pf}</div>
-    </div>
-    {open&&<div style={{padding:"0 8px 16px 44px",animation:"fadeIn .2s ease"}}>
-      <div style={{display:"flex",gap:12,marginBottom:12,flexWrap:"wrap"}}>
-        {[{l:"CLV (25%)",v:w.clv_score?.toFixed(2),c:"#00d4ff"},{l:"Timing (25%)",v:w.timing_score?.toFixed(2),c:"#a855f7"},
-          {l:"Consist (25%)",v:w.consistency_score?.toFixed(2),c:"#f5c842"},{l:"ROI (25%)",v:w.roi_score?.toFixed(2),c:"#00f5a0"}].map((s,i)=>
-          <div key={i} style={{background:"#080e14",border:"1px solid #1a2a3a",borderRadius:6,padding:"6px 10px",textAlign:"center"}}>
-            <div className="mono" style={{fontSize:14,fontWeight:700,color:s.c}}>{s.v}</div>
-            <div style={{fontSize:9,color:"#3a4a5a",marginTop:2}}>{s.l}</div></div>)}
+      <div style="text-align:right;flex-shrink:0">
+        <div class="direction ${sideClass}">${side}</div>
+        <div class="mono" style="font-size:11px;color:var(--text-muted);margin-top:2px">@ ${money(s.market_price)}</div>
       </div>
-      {w.category_scores&&Object.keys(w.category_scores).length>0&&<div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap"}}>
-        {Object.entries(w.category_scores).map(([cat,cs])=>
-          <div key={cat} style={{background:cs.tier==="sharp"?"rgba(0,245,160,.1)":"#080e14",border:`1px solid ${cs.tier==="sharp"?"#00f5a040":"#1a2a3a"}`,borderRadius:5,padding:"4px 8px",fontSize:10}}>
-            <span>{CE[cat]||"\ud83d\udcca"} {cat}</span>
-            <span className="mono" style={{marginLeft:6,fontWeight:700,color:cs.tier==="sharp"?"#00f5a0":cs.tier==="average"?"#8a9bb5":"#f54242"}}>{cs.tier.toUpperCase()}</span>
-            <span style={{color:"#3a4a5a",marginLeft:4}}>{cs.markets}m {(cs.win_rate*100).toFixed(0)}%wr</span>
-          </div>)}
-      </div>}
-      {ld&&<div style={{color:"#3a4a5a",fontSize:12,padding:8}}>Loading...</div>}
-      {live&&<>
-        {live.positions?.length>0&&<div style={{marginBottom:12}}>
-          <div style={{fontSize:10,color:"#5a7a9a",letterSpacing:1,marginBottom:6,fontWeight:700}}>POSITIONS ({live.position_count}) &middot; ${(live.total_position_value||0).toLocaleString("en",{maximumFractionDigits:0})}</div>
-          {live.positions.slice(0,8).map((p,i)=><div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"4px 0",borderBottom:"1px solid #0d1520",fontSize:12}}>
-            <span style={{color:"#c5d0de",flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",marginRight:8}}>{p.title?.slice(0,45)}</span>
-            <span style={{color:p.outcome?.toLowerCase()==="yes"?"#00f5a0":"#f54242",fontWeight:700,width:32,textAlign:"center",fontSize:11}}>{p.outcome}</span>
-            <span className="mono" style={{color:"#f5c842",width:60,textAlign:"right"}}>${(p.notional||0).toLocaleString("en",{maximumFractionDigits:0})}</span>
-          </div>)}</div>}
-        {live.recent_trades?.length>0&&<div>
-          <div style={{fontSize:10,color:"#5a7a9a",letterSpacing:1,marginBottom:6,fontWeight:700}}>RECENT TRADES</div>
-          {live.recent_trades.slice(0,6).map((t,i)=><div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"3px 0",fontSize:11,borderBottom:"1px solid #0a1018"}}>
-            <span style={{color:t.side==="BUY"?"#00f5a0":"#f54242",fontWeight:700,width:30}}>{t.side}</span>
-            <span style={{color:"#8a9bb5",flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",margin:"0 8px"}}>{t.title?.slice(0,40)}</span>
-            <span className="mono" style={{color:"#5a7a9a",width:50,textAlign:"right"}}>${t.notional}</span>
-          </div>)}</div>}
-      </>}
-    </div>}
-  </div>
+    </div>
+    ${k.status === 'sized' ? `
+    <div class="kelly-grid">
+      <div class="kelly-cell"><div class="val" style="color:var(--accent-green)">$${k.recommended_size_usd?.toFixed(0)||0}</div><div class="lbl">Kelly Size</div></div>
+      <div class="kelly-cell"><div class="val">${pct(k.kelly_fraction)}</div><div class="lbl">Fraction</div></div>
+      <div class="kelly-cell"><div class="val" style="color:var(--accent-amber)">${pct(k.estimated_edge)}</div><div class="lbl">Est. Edge</div></div>
+    </div>` : ''}`;
 }
 
-function MktCard({m}){
-  const gap=m.price_gap,div=m.divergence;
-  const dc={YES:{c:"#00f5a0",a:"\u25b2",label:"YES"},NO:{c:"#f54242",a:"\u25bc",label:"NO"},SPLIT:{c:"#5a7a9a",a:"\u25c6",label:"SPLIT"}}[m.smart_direction]||{c:"#5a7a9a",a:"?",label:"?"};
-  const totalSharps=m.sharp_yes_count+m.sharp_no_count;
-  const gapAbs=Math.abs(gap);
-  const strong=div>=.3&&gapAbs>=.08&&totalSharps>=3;
-  const moderate=div>=.15||gapAbs>=.05||totalSharps>=2;
-  const borderColor=strong?"#f5424440":moderate?"#f5c84225":"#1a2a3a";
-  return <div style={{background:"#0a1018",border:`1px solid ${borderColor}`,borderRadius:8,padding:14}}>
-    <div style={{marginBottom:10}}>
-      <div style={{fontSize:13,fontWeight:600,color:"#e8edf2",lineHeight:1.4,marginBottom:6}}>
-        {CE[m.sub_category]||CE[m.category]||"\ud83d\udcca"}{m.sub_category?<span style={{fontSize:10,color:"#5a7a9a",textTransform:"uppercase",marginLeft:4,marginRight:4}}>{m.sub_category}</span>:" "}{m.question?.slice(0,70)}
-      </div>
-      <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
-        <div style={{background:dc.c+"18",color:dc.c,padding:"4px 10px",borderRadius:5,fontSize:14,fontWeight:800,fontFamily:"'JetBrains Mono',monospace"}}>
-          {dc.a} Smart Money: {dc.label} {(m.smart_money_yes_pct*100).toFixed(0)}%
-        </div>
-        <span style={{fontSize:11,color:"#5a7a9a"}}>Mkt: {(m.market_price*100).toFixed(0)}%</span>
-        {gapAbs>=.05&&<span style={{fontSize:11,color:gapAbs>=.1?"#f5c842":"#a855f7",fontWeight:600}}>
-          {gap>0?"\u25b2 Underpriced":"\u25bc Overpriced"} by {(gapAbs*100).toFixed(0)}%
-        </span>}
-      </div>
-    </div>
-    <div style={{marginBottom:6}}>
-      <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"#5a7a9a",marginBottom:2}}>
-        <span>SHARP ({totalSharps} wallets) &mdash; ${(m.sharp_yes_notional+m.sharp_no_notional).toLocaleString("en",{maximumFractionDigits:0})}</span>
-        <span style={{color:dc.c}}>{(m.smart_money_yes_pct*100).toFixed(0)}% YES</span></div>
-      <Bar pct={m.smart_money_yes_pct} h={7}/>
-    </div>
-    <div style={{marginBottom:8}}>
-      <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"#3a4a5a",marginBottom:2}}>
-        <span>DULL ({m.dull_yes_count+m.dull_no_count} wallets)</span>
-        <span>{(m.dull_money_yes_pct*100).toFixed(0)}% YES</span></div>
-      <Bar pct={m.dull_money_yes_pct} h={5} o={.4}/>
-    </div>
-    <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
-      {div>=.3&&<span style={{background:"rgba(245,66,66,.15)",color:"#f54242",padding:"2px 8px",borderRadius:4,fontSize:10,fontWeight:700}}>{"\u26a1"} Sharp &amp; Dull Disagree ({(div*100).toFixed(0)}%)</span>}
-      {div>=.15&&div<.3&&<span style={{background:"rgba(245,200,66,.1)",color:"#f5c842",padding:"2px 8px",borderRadius:4,fontSize:10,fontWeight:600}}>Mild Divergence ({(div*100).toFixed(0)}%)</span>}
-      {strong&&<span style={{background:"rgba(168,85,247,.15)",color:"#a855f7",padding:"2px 8px",borderRadius:4,fontSize:10,fontWeight:700}}>{"\ud83c\udfaf"} Strong Signal</span>}
-      <span style={{fontSize:10,color:"#3a4a5a",marginLeft:"auto"}}>Vol: ${m.volume?.toLocaleString("en",{maximumFractionDigits:0})}</span>
-    </div>
-  </div>
+// --- Activity Feed ---
+function renderActivityFeed() {
+  const ls = DATA.liveScoring || {};
+  const recent = ls.recent_sharp_trades || ls.convergence_details || [];
+  const el = document.getElementById('activityFeed');
+  const badge = document.getElementById('sharpTradeCount');
+  badge.textContent = `${fmt(ls.sharp_trades_detected||0)} detected`;
+
+  if (!recent.length) {
+    // Try to build from convergence details
+    const convDetails = ls.convergence_details || [];
+    if (convDetails.length) {
+      el.innerHTML = convDetails.slice(0,6).map((c,i) => `
+        <div class="feed-item" style="animation:slideIn .3s ease ${i*.06}s both">
+          <div class="feed-dot fresh"></div>
+          <div class="feed-market">${esc(c.market_title||c.condition_id?.slice(0,12)||'Signal')}</div>
+          <div class="feed-size mono">${c.wallet_count||0} wallets</div>
+        </div>`).join('');
+      return;
+    }
+    el.innerHTML = `<div class="empty" style="padding:20px"><div class="icon">⏳</div>Listening for sharp wallet trades...<br><span class="mono" style="font-size:10px;color:var(--text-muted)">${fmt(ls.trades_processed||0)} trades processed</span></div>`;
+    return;
+  }
+  el.innerHTML = recent.slice(0,6).map((t,i) => {
+    const ago = timeAgo(t.timestamp);
+    const side = (t.side||'').toUpperCase();
+    return `
+    <div class="feed-item" style="animation:slideIn .3s ease ${i*.06}s both">
+      <div class="feed-dot ${i<2?'fresh':'stale'}"></div>
+      <div class="feed-time">${ago}</div>
+      <div class="feed-wallet">${(t.wallet||'').slice(0,8)}…</div>
+      <div class="feed-side ${side==='BUY'?'buy':'sell'}">${side}</div>
+      <div class="feed-market">${esc(t.title||t.market||'')}</div>
+      <div class="feed-size">$${fmt(t.notional||0)}</div>
+    </div>`;
+  }).join('');
 }
 
-function WhaleRow({w}){
-  return <div style={{display:"flex",alignItems:"center",padding:"10px 12px",borderBottom:"1px solid #0d1520",gap:8}}>
-    <div style={{width:6,height:6,borderRadius:3,background:w.is_sharp?"#00f5a0":"#1a2a3a",flexShrink:0}}/>
-    <div style={{flex:1,minWidth:0}}>
-      <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:2}}>
-        <span style={{fontSize:12,fontWeight:600,color:"#e8edf2"}}>{w.display_name}</span>
-        {w.is_sharp&&<span style={{fontSize:9,background:"rgba(0,245,160,.12)",color:"#00f5a0",padding:"1px 6px",borderRadius:3,fontWeight:700}}>SHARP{w.category_detail?` \u00b7 ${w.category_detail.toUpperCase()}`:""}
-        </span>}
-        {!w.is_sharp&&<span style={{fontSize:9,color:"#3a4a5a"}}>{w.tier}</span>}
-      </div>
-      <div style={{fontSize:11,color:"#5a7a9a",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{w.title}</div>
-    </div>
-    <div style={{textAlign:"right",flexShrink:0}}>
-      <div style={{fontSize:14,fontWeight:800,color:w.outcome==="YES"?"#00f5a0":"#f54242",fontFamily:"'JetBrains Mono',monospace"}}>{w.outcome}</div>
-      <div className="mono" style={{fontSize:11,color:"#f5c842"}}>${(w.notional/1000).toFixed(0)}K @ {(w.avg_price*100).toFixed(0)}&cent;</div>
-    </div>
-  </div>
-}
-
-function CategorySection({cat,label,emoji,wallets}){
-  const[open,setOpen]=useState(false);
-  const catWallets=wallets.filter(w=>{const cs=w.category_scores||{};return cs[cat]&&cs[cat].tier==="sharp"})
-    .sort((a,b)=>(b.category_scores[cat]?.sharpness||0)-(a.category_scores[cat]?.sharpness||0));
-  if(catWallets.length===0)return null;
-  return <div style={{background:"#0a1018",border:"1px solid #1a2a3a",borderRadius:8,overflow:"hidden",marginBottom:8}}>
-    <div onClick={()=>setOpen(!open)} style={{padding:"12px 14px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-      <div style={{display:"flex",alignItems:"center",gap:8}}>
-        <span style={{fontSize:18}}>{emoji}</span>
-        <span style={{fontSize:13,fontWeight:700,color:"#e8edf2"}}>{label}</span>
-        <span className="mono" style={{fontSize:11,color:"#00f5a0",background:"rgba(0,245,160,.1)",padding:"2px 8px",borderRadius:4}}>{catWallets.length} sharp</span>
-      </div>
-      <span style={{color:"#3a4a5a",fontSize:12}}>{open?"\u25b2":"\u25bc"}</span>
-    </div>
-    {open&&<div style={{borderTop:"1px solid #111b26"}}>
-      <div style={{display:"grid",gridTemplateColumns:"36px 1fr 80px 52px 60px 52px 70px",padding:"6px 10px",borderBottom:"1px solid #111b26"}}>
-        {["#","Wallet","Score","CLV","WR","Mkts","PnL"].map((h,i)=><span key={i} style={{fontSize:8,fontWeight:700,color:"#2a3a4a",letterSpacing:1,textTransform:"uppercase",textAlign:i>1?"right":"left"}}>{h}</span>)}</div>
-      {catWallets.map((w,i)=>{const cs=w.category_scores[cat];
-        return <WalletRow key={w.wallet} w={{...w,sharpness_score:cs.sharpness,win_rate:cs.win_rate,total_pnl:cs.pnl,distinct_markets:cs.markets,avg_clv:cs.avg_clv}} rank={i+1}/>})}
-    </div>}
-  </div>
-}
-
-function App(){
-  const[tab,setTab]=useState("dashboard");
-  const[wF,setWF]=useState("all");
-  const[wS,setWS]=useState("sharpness");
-  const stats=useApi("/api/stats",5000);
-  const wD=useApi("/api/wallets?limit=200",60000);
-  const cD=useApi("/api/convergence",60000);
-  const mD=useApi("/api/markets?limit=50",60000);
-  const whaleD=useApi("/api/whales?min_notional=25000",120000);
-  const wallets=wD?.wallets||[],signals=cD?.signals||[],markets=mD?.markets||[];
-  const whales=whaleD?.whales||[];
-  const tiers=stats?.tiers||{};
-  const fw=wF==="all"?wallets:wallets.filter(w=>w.tier===wF);
-  const sk={sharpness:"sharpness_score",pnl:"total_pnl",clv:"avg_clv",winrate:"win_rate",markets:"distinct_markets"};
-  const sw=[...fw].sort((a,b)=>(b[sk[wS]]||0)-(a[sk[wS]]||0));
-
-  const Btn=({id,label})=><button onClick={()=>setTab(id)} style={{background:tab===id?"#1a2a3a":"transparent",color:tab===id?"#e8edf2":"#5a7a9a",border:`1px solid ${tab===id?"#2a3a4a":"transparent"}`,borderRadius:6,padding:"6px 14px",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}}>{label}</button>;
-  const FB=({v,l,set,cur})=><button onClick={()=>set(v)} style={{background:cur===v?"#1a2a3a":"transparent",color:cur===v?"#e8edf2":"#5a7a9a",border:`1px solid ${cur===v?"#2a3a4a":"transparent"}`,borderRadius:4,padding:"3px 8px",fontSize:10,cursor:"pointer",fontFamily:"'DM Sans',sans-serif",textTransform:"uppercase"}}>{l}</button>;
-  const WH=<div style={{display:"grid",gridTemplateColumns:"36px 1fr 80px 52px 60px 52px 70px",padding:"8px",borderBottom:"2px solid #1a2a3a"}}>
-    {["#","Wallet","Score","CLV","Win%","Mkts","PnL"].map((h,i)=><span key={i} style={{fontSize:9,fontWeight:700,color:"#3a4a5a",letterSpacing:1.5,textTransform:"uppercase",textAlign:i>1?"right":"left"}}>{h}</span>)}</div>;
-
-  return <div style={{maxWidth:1200,margin:"0 auto",padding:"16px 16px 40px"}}>
-    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20,flexWrap:"wrap",gap:10}}>
+// --- Top Divergence ---
+function renderTopDivergence() {
+  const markets = DATA.markets?.markets || [];
+  const el = document.getElementById('topDivergence');
+  const badge = document.getElementById('divergenceScore');
+  if (!markets.length) {
+    badge.textContent = '—';
+    el.innerHTML = `<div class="empty"><div class="icon">📈</div>No market intelligence yet</div>`;
+    return;
+  }
+  const m = markets[0];
+  const div = m.divergence_score || 0;
+  badge.textContent = `${(div*100).toFixed(0)}% divergence`;
+  const sharpDir = m.sharp_direction || '—';
+  const dullDir = m.dull_direction || '—';
+  el.innerHTML = `
+    <div class="signal-market" style="font-size:13px;margin-bottom:10px">${esc(m.title||m.condition_id?.slice(0,16)||'Market')}</div>
+    <div style="display:flex;justify-content:space-between;margin-bottom:10px">
       <div>
-        <h1 className="mono" style={{fontSize:20,fontWeight:800,color:"#e8edf2",letterSpacing:-.5}}>SHARPFLOW</h1>
-        <div style={{fontSize:11,color:"#3a4a5a",marginTop:2}}>Polymarket Smart Money Intelligence</div>
+        <div style="font-size:9px;color:var(--text-muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:2px">Sharp Money</div>
+        <div class="mono" style="font-size:14px;font-weight:700;color:var(--accent-green)">${sharpDir.toUpperCase()}</div>
+        <div class="mono" style="font-size:10px;color:var(--text-muted)">$${fmt(m.sharp_volume||0)} · ${m.sharp_count||0} wallets</div>
       </div>
-      <div style={{display:"flex",alignItems:"center",gap:8}}>
-        {stats?.status==="ready"?<span style={{fontSize:10,color:"#00f5a0"}}>{"\u25cf"} Live</span>:
-         stats?.status==="running"?<span style={{fontSize:10,color:"#f5c842",animation:"pulse 1.5s infinite"}}>{"\u25cf"} {stats?.progress||"Refreshing..."}</span>:
-         <span style={{fontSize:10,color:"#f54242"}}>{"\u25cf"} {stats?.status||"Loading"}</span>}
-        <span style={{fontSize:10,color:"#2a3a4a"}}>{stats?.last_refresh?new Date(stats.last_refresh+"Z").toLocaleTimeString():""}</span>
+      <div style="text-align:right">
+        <div style="font-size:9px;color:var(--text-muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:2px">Dull Money</div>
+        <div class="mono" style="font-size:14px;font-weight:700;color:var(--text-muted)">${dullDir.toUpperCase()}</div>
+        <div class="mono" style="font-size:10px;color:var(--text-muted)">$${fmt(m.dull_volume||0)} · ${m.dull_count||0} wallets</div>
       </div>
     </div>
-
-    <div style={{display:"flex",gap:4,marginBottom:16}}>
-      <Btn id="dashboard" label="Dashboard"/>
-      <Btn id="markets" label={`Markets${markets.length?` (${markets.length})`:""}`}/>
-      <Btn id="wallets" label="Leaderboard"/>
+    <div style="display:flex;align-items:center;gap:8px">
+      <div style="font-size:9px;color:var(--text-muted)">DIV</div>
+      <div class="bar-track" style="flex:1"><div class="bar-fill amber" style="width:${div*100}%"></div></div>
+      <div class="mono" style="font-size:10px;color:var(--accent-amber)">${(div*100).toFixed(0)}%</div>
     </div>
-
-    {tab==="dashboard"&&<div style={{animation:"fadeIn .2s ease"}}>
-      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(95px,1fr))",gap:8,marginBottom:20}}>
-        <Stat value={stats?.wallets_scored||0} label="Wallets"/>
-        <Stat value={tiers.sharp||0} label="Sharp" color="#00f5a0"/>
-        <Stat value={signals.length} label="Convergence" color="#a855f7"/>
-        <Stat value={markets.length} label="Mkts Intel" color="#f5c842"/>
-        <Stat value={stats?.markets_analyzed||0} label="Analyzed" color="#5a7a9a"/>
-      </div>
-
-      {/* Whale Trades */}
-      <div style={{marginBottom:24}}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
-          <h2 style={{fontSize:13,fontWeight:700,color:"#f5c842",letterSpacing:1}}>{"\ud83d\udc0b"} WHALE TRADES</h2>
-          <span style={{fontSize:10,color:"#3a4a5a"}}>$25K+ positions{whaleD?` \u00b7 ${whaleD.sharp_whales||0} from sharp wallets`:""}</span>
-        </div>
-        <div style={{background:"#0a1018",border:"1px solid #1a2a3a",borderRadius:8,overflow:"hidden"}}>
-          {whales.length>0?whales.slice(0,10).map((w,i)=><WhaleRow key={i} w={w}/>):
-            <div style={{padding:20,textAlign:"center",color:"#3a4a5a",fontSize:12}}>Loading whale positions...</div>}
-        </div>
-      </div>
-
-      {signals.length>0&&<div style={{marginBottom:24}}>
-        <h2 style={{fontSize:13,fontWeight:700,color:"#a855f7",marginBottom:8,letterSpacing:1}}>{"\ud83c\udfaf"} CONVERGENCE SIGNALS</h2>
-        {signals.slice(0,5).map((s,i)=><div key={i} style={{background:"#0a1018",border:"1px solid #1a2a3a",borderRadius:6,padding:12,marginBottom:6,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-          <div style={{flex:1}}><div style={{fontSize:13,color:"#e8edf2",fontWeight:600}}>{s.market_title?.slice(0,60)}</div>
-            <div style={{fontSize:10,color:"#3a4a5a",marginTop:2}}>{s.wallet_count} sharp wallets &middot; Strength: {s.strength?.toFixed(2)}</div></div>
-          <div style={{fontWeight:800,fontSize:16,color:s.side==="YES"?"#00f5a0":"#f54242"}}>{s.side}</div></div>)}
-      </div>}
-
-      <div style={{marginBottom:24}}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
-          <h2 style={{fontSize:13,fontWeight:700,color:"#a855f7",letterSpacing:1}}>{"\ud83d\udca1"} MARKET SIGNALS</h2>
-          <button onClick={()=>setTab("markets")} style={{background:"none",border:"none",color:"#a855f7",fontSize:11,cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}}>View all &rarr;</button>
-        </div>
-        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(300px,1fr))",gap:8}}>
-          {markets.slice(0,4).map((m,i)=><MktCard key={i} m={m}/>)}
-        </div>
-        {!markets.length&&<div style={{background:"#0a1018",border:"1px solid #1a2a3a",borderRadius:8,padding:20,textAlign:"center",color:"#3a4a5a",fontSize:12}}>Market intel appears after pipeline run</div>}
-      </div>
-    </div>}
-
-    {tab==="markets"&&<div style={{animation:"fadeIn .2s ease"}}>
-      <div style={{background:"#0a1018",border:"1px solid #1a2a3a",borderRadius:8,padding:12,marginBottom:16,fontSize:11,color:"#5a7a9a",lineHeight:1.6}}>
-        <b style={{color:"#e8edf2"}}>How to read:</b> <span style={{color:"#00f5a0"}}>Green</span> = sharp money YES, <span style={{color:"#f54242"}}>red</span> = NO. <b>Price Gap</b> = market vs smart money. <b style={{color:"#f54242"}}>Divergence</b> = sharp &amp; dull disagree. Min 3 sharp wallets per card.</div>
-      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(340px,1fr))",gap:10}}>
-        {markets.map((m,i)=><MktCard key={i} m={m}/>)}
-      </div>
-      {!markets.length&&<div style={{textAlign:"center",color:"#3a4a5a",padding:40}}>No market intel yet — need 3+ sharp wallets per market.</div>}
-    </div>}
-
-    {tab==="wallets"&&<div style={{animation:"fadeIn .2s ease"}}>
-      <div style={{marginBottom:24}}>
-        <h2 style={{fontSize:13,fontWeight:700,color:"#00d4ff",letterSpacing:1,marginBottom:10}}>{"\ud83c\udfc6"} CATEGORY LEADERBOARDS</h2>
-        <div style={{fontSize:11,color:"#5a7a9a",marginBottom:12}}>Wallets scored per category/sport. 8+ markets to qualify. Click to expand and view trades.</div>
-        <CategorySection cat="nba" label="NBA" emoji={"\ud83c\udfc0"} wallets={wallets}/>
-        <CategorySection cat="nfl" label="NFL" emoji={"\ud83c\udfc8"} wallets={wallets}/>
-        <CategorySection cat="mlb" label="MLB" emoji={"\u26be"} wallets={wallets}/>
-        <CategorySection cat="nhl" label="NHL" emoji={"\ud83c\udfd2"} wallets={wallets}/>
-        <CategorySection cat="soccer" label="Soccer" emoji={"\u26bd"} wallets={wallets}/>
-        <CategorySection cat="ufc" label="UFC / MMA" emoji={"\ud83e\udd4a"} wallets={wallets}/>
-        <CategorySection cat="sports" label="All Sports" emoji={"\ud83c\udfc0"} wallets={wallets}/>
-        <CategorySection cat="politics" label="Politics" emoji={"\ud83c\udfdb\ufe0f"} wallets={wallets}/>
-        <CategorySection cat="other" label="Other" emoji={"\ud83d\udcca"} wallets={wallets}/>
-      </div>
-
-      <h2 style={{fontSize:13,fontWeight:700,color:"#00d4ff",letterSpacing:1,marginBottom:10}}>{"\ud83d\udc5b"} ALL WALLETS</h2>
-      <div style={{display:"flex",gap:6,marginBottom:12,flexWrap:"wrap",alignItems:"center"}}>
-        <span style={{fontSize:10,color:"#3a4a5a",marginRight:4}}>TIER:</span>
-        <FB v="all" l={`All (${wallets.length})`} set={setWF} cur={wF}/>
-        {["sharp","average","dull"].map(f=><FB key={f} v={f} l={`${f} (${wallets.filter(w=>w.tier===f).length})`} set={setWF} cur={wF}/>)}
-        <span style={{fontSize:10,color:"#3a4a5a",marginLeft:12,marginRight:4}}>SORT:</span>
-        {["sharpness","pnl","clv","winrate","markets"].map(s=><FB key={s} v={s} l={s} set={setWS} cur={wS}/>)}
-      </div>
-      <div style={{background:"#0a1018",border:"1px solid #1a2a3a",borderRadius:8,overflow:"hidden"}}>
-        {WH}{sw.map((w,i)=><WalletRow key={w.wallet} w={w} rank={i+1}/>)}
-        {!sw.length&&<div style={{padding:20,textAlign:"center",color:"#3a4a5a"}}>No wallets match</div>}
-      </div>
-    </div>}
-
-    <div style={{marginTop:30,padding:16,textAlign:"center",fontSize:10,color:"#1a2a3a",borderTop:"1px solid #111b26"}}>
-      SharpFlow v2.2 &middot; Not financial advice</div>
-  </div>
+    ${markets.length > 1 ? `<div style="margin-top:8px;font-size:10px;color:var(--text-muted);cursor:pointer" onclick="switchTab('markets')">+ ${markets.length-1} more markets →</div>` : ''}`;
 }
-ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+
+// --- Nav Counts ---
+function renderNavCounts() {
+  document.getElementById('navSignals').textContent = DATA.convergence?.total || 0;
+  document.getElementById('navMarkets').textContent = DATA.markets?.total || 0;
+  document.getElementById('navWallets').textContent = DATA.wallets?.total || 0;
+  document.getElementById('navSuspicious').textContent = DATA.suspicious?.total || 0;
+}
+
+// --- Signals Tab ---
+function renderSignalsTab() {
+  const signals = DATA.kelly?.signals || [];
+  const el = document.getElementById('signalsList');
+  if (!signals.length) {
+    el.innerHTML = `<div class="empty" style="padding:60px 20px"><div class="icon">📡</div>No convergence signals yet<br><span style="font-size:11px">Signals appear when multiple sharp wallets enter the same market on the same side</span></div>`;
+    return;
+  }
+  el.innerHTML = signals.map((s,i) => {
+    const k = s.kelly || {};
+    const side = (s.side||'').toUpperCase();
+    const sideClass = side.includes('YES')||side.includes('BUY') ? 'yes' : 'no';
+    return `
+    <div class="card fade-up" style="margin-bottom:8px;animation-delay:${i*.05}s">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">
+        <div style="flex:1;min-width:200px">
+          <div style="display:flex;gap:6px;margin-bottom:6px">
+            <span class="tier sharp">${s.signal_type||'CONVERGENCE'}</span>
+          </div>
+          <div class="signal-market">${esc(s.market||'')}</div>
+          <div class="signal-meta" style="margin-top:4px">
+            <span>👛 ${s.wallet_count||0} wallets</span>
+            <span>💪 ${pct(s.strength)}</span>
+            ${s.freshness!==undefined?`<span>🕐 ${pct(s.freshness)}</span>`:''}
+          </div>
+        </div>
+        <div style="text-align:right">
+          <div class="mono" style="font-size:22px;font-weight:800;color:${sideClass==='yes'?'var(--accent-green)':'var(--accent-red)'}">${side}</div>
+          <div class="mono" style="font-size:10px;color:var(--text-muted)">@ ${money(s.market_price)}</div>
+        </div>
+      </div>
+      ${k.status==='sized'?`
+      <div class="kelly-grid" style="margin-top:12px">
+        <div class="kelly-cell"><div class="val" style="color:var(--accent-green)">$${k.recommended_size_usd?.toFixed(0)||0}</div><div class="lbl">Kelly Size</div></div>
+        <div class="kelly-cell"><div class="val">${pct(k.kelly_fraction)}</div><div class="lbl">Fraction</div></div>
+        <div class="kelly-cell"><div class="val">${money(k.entry_price)}</div><div class="lbl">Entry</div></div>
+      </div>`:''}
+    </div>`;
+  }).join('');
+}
+
+// --- Markets Tab ---
+function renderMarketsTab() {
+  const markets = DATA.markets?.markets || [];
+  const el = document.getElementById('marketsList');
+  if (!markets.length) {
+    el.innerHTML = `<div class="empty" style="padding:60px"><div class="icon">📈</div>No market intelligence yet</div>`;
+    return;
+  }
+  el.innerHTML = markets.slice(0,30).map((m,i) => {
+    const div = m.divergence_score||0;
+    const sharpDir = (m.sharp_direction||'').toUpperCase();
+    const dullDir = (m.dull_direction||'').toUpperCase();
+    const disagree = sharpDir && dullDir && sharpDir !== dullDir;
+    return `
+    <div class="intel-card fade-up" style="animation-delay:${i*.03}s">
+      <div class="intel-title">${esc(m.title||m.condition_id?.slice(0,20)||'')}</div>
+      <div class="intel-row">
+        <div>
+          <span class="intel-label">Sharp</span>
+          <span class="mono" style="font-weight:700;color:var(--accent-green);margin-left:6px">${sharpDir||'—'}</span>
+          <span class="mono" style="font-size:10px;color:var(--text-muted);margin-left:4px">$${fmt(m.sharp_volume||0)}</span>
+        </div>
+        <div>
+          <span class="intel-label">Dull</span>
+          <span class="mono" style="font-weight:600;color:${disagree?'var(--accent-red)':'var(--text-muted)'};margin-left:6px">${dullDir||'—'}</span>
+          <span class="mono" style="font-size:10px;color:var(--text-muted);margin-left:4px">$${fmt(m.dull_volume||0)}</span>
+        </div>
+        <div class="divergence-bar">
+          <div class="bar-track" style="width:60px"><div class="bar-fill amber" style="width:${div*100}%"></div></div>
+          <span class="mono" style="font-size:10px;color:var(--accent-amber)">${(div*100).toFixed(0)}%</span>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// --- Wallets Tab ---
+function renderWalletsTab() {
+  const wallets = DATA.wallets?.wallets || [];
+  const el = document.getElementById('walletsTable');
+  if (!wallets.length) {
+    el.innerHTML = `<div class="empty" style="padding:60px"><div class="icon">👛</div>No scored wallets yet</div>`;
+    return;
+  }
+  el.innerHTML = `<table>
+    <tr><th>#</th><th>Wallet</th><th>Sharpness</th><th>Tier</th><th>Win Rate</th><th>ROI</th><th>CLV</th><th>Markets</th><th>PnL</th></tr>
+    ${wallets.slice(0,50).map((w,i) => `
+    <tr class="fade-up" style="animation-delay:${i*.02}s">
+      <td class="mono" style="color:var(--text-muted);font-size:10px">${w.rank||i+1}</td>
+      <td><span class="mono" style="font-size:11px;color:var(--accent-purple)">${(w.wallet||'').slice(0,10)}…</span><br><span style="font-size:10px;color:var(--text-muted)">${esc(w.display_name||'')}</span></td>
+      <td><span class="mono" style="font-weight:700;color:var(--text-primary)">${(w.sharpness_score||0).toFixed(3)}</span></td>
+      <td><span class="tier ${(w.tier||'').toLowerCase()}">${(w.tier||'').toUpperCase()}</span></td>
+      <td class="mono" style="font-size:11px">${pct(w.win_rate)}</td>
+      <td class="mono" style="font-size:11px;color:${(w.roi||0)>=0?'var(--accent-green)':'var(--accent-red)'}">${(w.roi*100||0).toFixed(1)}%</td>
+      <td class="mono" style="font-size:11px">${(w.avg_clv||0).toFixed(3)}</td>
+      <td class="mono" style="font-size:11px">${w.distinct_markets||0}</td>
+      <td class="mono" style="font-size:11px;color:${(w.total_pnl||0)>=0?'var(--accent-green)':'var(--accent-red)'}">$${fmt(w.total_pnl||0)}</td>
+    </tr>`).join('')}
+  </table>`;
+}
+
+// --- Suspicious Tab ---
+function renderSuspiciousTab() {
+  const list = DATA.suspicious?.flagged || [];
+  const el = document.getElementById('suspiciousList');
+  if (!list.length) {
+    el.innerHTML = `<div class="empty" style="padding:60px"><div class="icon">🔍</div>No suspicious wallets flagged</div>`;
+    return;
+  }
+  el.innerHTML = list.slice(0,30).map((w,i) => {
+    const e = w.evidence || {};
+    const sc = w.scores || {};
+    return `
+    <div class="card fade-up" style="margin-bottom:8px;animation-delay:${i*.04}s;border-color:${w.tier==='HIGHLY_SUSPICIOUS'?'rgba(239,68,68,.15)':'var(--border)'}">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px">
+        <div>
+          <span class="tier ${(w.tier||'').toLowerCase()}">${w.tier}</span>
+          <span class="mono" style="font-size:11px;color:var(--accent-purple);margin-left:8px">${w.wallet?.slice(0,14)||''}…</span>
+        </div>
+        <div class="mono" style="font-size:18px;font-weight:800;color:${w.suspicion_score>=0.7?'var(--accent-red)':'var(--accent-amber)'}">${w.suspicion_score?.toFixed(2)}</div>
+      </div>
+      <div class="evidence-grid">
+        <div class="evidence-cell"><div class="val" style="color:var(--accent-amber)">${e.wallet_age_days?.toFixed(0)||'?'}d</div><div class="lbl">Age</div></div>
+        <div class="evidence-cell"><div class="val" style="color:var(--accent-green)">${pct(e.win_rate)}</div><div class="lbl">Win Rate</div></div>
+        <div class="evidence-cell"><div class="val">$${fmt(e.avg_bet_size||0)}</div><div class="lbl">Avg Bet</div></div>
+        <div class="evidence-cell"><div class="val">${e.resolved_markets||0}</div><div class="lbl">Resolved</div></div>
+        <div class="evidence-cell"><div class="val">${pct(e.single_entry_pct)}</div><div class="lbl">Conviction</div></div>
+        <div class="evidence-cell"><div class="val">$${fmt(w.total_volume||0)}</div><div class="lbl">Volume</div></div>
+      </div>
+      ${w.top_wins?.length ? `
+      <div style="margin-top:10px">
+        <div style="font-size:9px;color:var(--text-muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">Top Wins</div>
+        ${w.top_wins.slice(0,3).map(t => `
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:3px 0;font-size:11px">
+            <span style="color:var(--text-secondary);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-right:8px">${esc(t.title||'')}</span>
+            <span class="mono" style="color:var(--accent-green);flex-shrink:0">$${fmt(t.notional||0)}</span>
+          </div>`).join('')}
+      </div>` : ''}
+      ${w.losses?.length ? `<div style="margin-top:4px;font-size:10px;color:var(--accent-red)">${w.losses.length} loss${w.losses.length>1?'es':''}</div>` : '<div style="margin-top:4px;font-size:10px;color:var(--accent-red)">Zero losses</div>'}
+    </div>`;
+  }).join('');
+}
+
+// ============================================================
+// TAB SWITCHING
+// ============================================================
+function switchTab(tab) {
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.toggle('active', t.id === 'tab-'+tab));
+}
+document.getElementById('nav').addEventListener('click', e => {
+  const btn = e.target.closest('.nav-btn');
+  if (btn) switchTab(btn.dataset.tab);
+});
+document.getElementById('bankrollInput')?.addEventListener('change', fetchAll);
+
+// ============================================================
+// HELPERS
+// ============================================================
+function fmt(n) {
+  if (n === undefined || n === null) return '0';
+  if (typeof n !== 'number') n = parseFloat(n) || 0;
+  if (Math.abs(n) >= 1e6) return (n/1e6).toFixed(1) + 'M';
+  if (Math.abs(n) >= 1e4) return (n/1e3).toFixed(1) + 'K';
+  if (Math.abs(n) >= 1e3) return (n/1e3).toFixed(1) + 'K';
+  return n.toFixed(n % 1 === 0 ? 0 : 1);
+}
+function pct(n) { return ((n||0)*100).toFixed(1) + '%'; }
+function money(n) { return (n||0).toFixed(2) + '¢'; }
+function esc(s) { const d = document.createElement('div'); d.textContent = s||''; return d.innerHTML; }
+function timeAgo(ts) {
+  if (!ts) return '—';
+  const s = Math.floor(Date.now()/1000 - ts);
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s/60) + 'm';
+  if (s < 86400) return Math.floor(s/3600) + 'h';
+  return Math.floor(s/86400) + 'd';
+}
+
+// ============================================================
+// INIT
+// ============================================================
+fetchAll();
+setInterval(fetchAll, 30000); // refresh every 30s
 </script>
 </body></html>
